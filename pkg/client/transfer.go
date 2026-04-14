@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -97,6 +98,11 @@ const (
 
 var errReadTargetNoRedirect = errors.New("parallel download unavailable without redirect")
 
+const (
+	presignBatchSizeHeader = "X-Dat9-Presign-Batch-Size"
+	presignElapsedMsHeader = "X-Dat9-Presign-Elapsed-Ms"
+)
+
 // DownloadSummary exposes the coarse-grained large-file download metrics that
 // the CLI emits as a structured log event when CLI logging is enabled.
 type DownloadSummary struct {
@@ -115,25 +121,40 @@ type DownloadSummary struct {
 // UploadSummary exposes coarse-grained upload timings for CLI benchmark and
 // diagnosis workflows.
 type UploadSummary struct {
-	Type               string    `json:"type"`
-	Mode               string    `json:"mode"`
-	StartedAt          time.Time `json:"started_at"`
-	FinishedAt         time.Time `json:"finished_at"`
-	ElapsedSeconds     float64   `json:"elapsed_seconds"`
-	RemotePath         string    `json:"remote_path"`
-	TotalBytes         int64     `json:"total_bytes"`
-	PartSizeBytes      int64     `json:"part_size_bytes"`
-	TotalParts         int       `json:"total_parts"`
-	UploadedParts      int       `json:"uploaded_parts"`
-	Parallelism        int       `json:"parallelism"`
-	QuerySeconds       float64   `json:"query_seconds"`
-	ChecksumSeconds    float64   `json:"checksum_seconds"`
-	InitiateSeconds    float64   `json:"initiate_seconds"`
-	ResumeSeconds      float64   `json:"resume_seconds"`
-	PresignSeconds     float64   `json:"presign_seconds"`
-	UploadSeconds      float64   `json:"upload_seconds"`
-	CompleteSeconds    float64   `json:"complete_seconds"`
-	DirectWriteSeconds float64   `json:"direct_write_seconds"`
+	Type                                string    `json:"type"`
+	Mode                                string    `json:"mode"`
+	StartedAt                           time.Time `json:"started_at"`
+	FinishedAt                          time.Time `json:"finished_at"`
+	ElapsedSeconds                      float64   `json:"elapsed_seconds"`
+	RemotePath                          string    `json:"remote_path"`
+	TotalBytes                          int64     `json:"total_bytes"`
+	PartSizeBytes                       int64     `json:"part_size_bytes"`
+	TotalParts                          int       `json:"total_parts"`
+	UploadedParts                       int       `json:"uploaded_parts"`
+	Parallelism                         int       `json:"parallelism"`
+	QuerySeconds                        float64   `json:"query_seconds"`
+	ChecksumSeconds                     float64   `json:"checksum_seconds"`
+	InitiateSeconds                     float64   `json:"initiate_seconds"`
+	ResumeSeconds                       float64   `json:"resume_seconds"`
+	PresignSeconds                      float64   `json:"presign_seconds"`
+	PresignBatchRequests                int       `json:"presign_batch_requests"`
+	PresignBatchPartsTotal              int       `json:"presign_batch_parts_total"`
+	MaxPresignBatchSize                 int       `json:"max_presign_batch_size"`
+	ServerPresignObservedBatches        int       `json:"server_presign_observed_batches"`
+	ServerPresignReportedSeconds        float64   `json:"server_presign_reported_seconds"`
+	ServerPresignReportedSecondsPerPart float64   `json:"server_presign_reported_seconds_per_part"`
+	UploadSeconds                       float64   `json:"upload_seconds"`
+	CompleteSeconds                     float64   `json:"complete_seconds"`
+	DirectWriteSeconds                  float64   `json:"direct_write_seconds"`
+}
+
+type presignPipelineStats struct {
+	requests              int
+	partsTotal            int
+	maxBatchSize          int
+	serverObservedBatches int
+	serverReportedSeconds float64
+	serverReportedParts   int
 }
 
 type downloadRange struct {
@@ -387,12 +408,15 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 	parallelism := uploadParallelism(plan.PartSize)
 	presignCh := make(chan presignedPart, parallelism)
 	presignErrCh := make(chan error, 1)
-	presignDurationCh := make(chan time.Duration, 1)
+	presignStatsCh := make(chan presignPipelineStats, 1)
 
 	go func() {
 		start := time.Now()
-		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
-		presignDurationCh <- time.Since(start)
+		stats := c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
+		if summary != nil {
+			summary.PresignSeconds = time.Since(start).Seconds()
+		}
+		presignStatsCh <- stats
 	}()
 
 	// Upload parts, collecting ETags for the complete call.
@@ -404,10 +428,14 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 	}
 	if summary != nil {
 		summary.UploadSeconds = time.Since(uploadStart).Seconds()
-		select {
-		case dur := <-presignDurationCh:
-			summary.PresignSeconds = dur.Seconds()
-		default:
+		stats := <-presignStatsCh
+		summary.PresignBatchRequests = stats.requests
+		summary.PresignBatchPartsTotal = stats.partsTotal
+		summary.MaxPresignBatchSize = stats.maxBatchSize
+		summary.ServerPresignObservedBatches = stats.serverObservedBatches
+		summary.ServerPresignReportedSeconds = stats.serverReportedSeconds
+		if stats.serverReportedParts > 0 {
+			summary.ServerPresignReportedSecondsPerPart = stats.serverReportedSeconds / float64(stats.serverReportedParts)
 		}
 	}
 
@@ -722,13 +750,20 @@ func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, 
 // presignPipeline runs in a background goroutine. It fetches presigned URLs
 // in batches via POST /v2/uploads/{id}/presign-batch and sends them to presignCh.
 // The channel is closed when all parts have been presigned or an error occurs.
-func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchSize int, presignCh chan<- presignedPart, errCh chan<- error) {
+func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchSize int, presignCh chan<- presignedPart, errCh chan<- error) presignPipelineStats {
 	defer close(presignCh)
+	var stats presignPipelineStats
 
 	for start := 1; start <= plan.TotalParts; start += batchSize {
 		end := start + batchSize - 1
 		if end > plan.TotalParts {
 			end = plan.TotalParts
+		}
+		currentBatchSize := end - start + 1
+		stats.requests++
+		stats.partsTotal += currentBatchSize
+		if currentBatchSize > stats.maxBatchSize {
+			stats.maxBatchSize = currentBatchSize
 		}
 
 		// Build batch request (no checksums in phase 1)
@@ -746,29 +781,30 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 		}{Parts: entries})
 		if err != nil {
 			errCh <- fmt.Errorf("marshal presign batch: %w", err)
-			return
+			return stats
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 			c.baseURL+"/v2/uploads/"+plan.UploadID+"/presign-batch", bytes.NewReader(body))
 		if err != nil {
 			errCh <- fmt.Errorf("create presign batch request: %w", err)
-			return
+			return stats
 		}
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := c.do(req)
 		if err != nil {
 			errCh <- fmt.Errorf("presign batch: %w", err)
-			return
+			return stats
 		}
 
 		if resp.StatusCode >= 300 {
 			err = readError(resp)
 			_ = resp.Body.Close()
 			errCh <- fmt.Errorf("presign batch HTTP %d: %w", resp.StatusCode, err)
-			return
+			return stats
 		}
+		recordPresignBatchTelemetry(&stats, resp.Header)
 
 		var result struct {
 			Parts []presignedPart `json:"parts"`
@@ -776,7 +812,7 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			_ = resp.Body.Close()
 			errCh <- fmt.Errorf("decode presign batch: %w", err)
-			return
+			return stats
 		}
 		_ = resp.Body.Close()
 
@@ -785,10 +821,47 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 			case presignCh <- p:
 			case <-ctx.Done():
 				errCh <- ctx.Err()
-				return
+				return stats
 			}
 		}
 	}
+	return stats
+}
+
+func recordPresignBatchTelemetry(stats *presignPipelineStats, header http.Header) {
+	if stats == nil {
+		return
+	}
+	batchSize, okBatch := parsePositiveIntHeader(header.Get(presignBatchSizeHeader))
+	elapsedMs, okElapsed := parseNonNegativeFloatHeader(header.Get(presignElapsedMsHeader))
+	if !okBatch || !okElapsed {
+		return
+	}
+	stats.serverObservedBatches++
+	stats.serverReportedParts += batchSize
+	stats.serverReportedSeconds += elapsedMs / 1000
+}
+
+func parsePositiveIntHeader(v string) (int, bool) {
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func parseNonNegativeFloatHeader(v string) (float64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0, false
+	}
+	return f, true
 }
 
 // uploadPartsV2 reads presigned URLs from presignCh and uploads parts concurrently.

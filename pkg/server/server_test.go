@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -132,6 +133,53 @@ func TestStat(t *testing.T) {
 	}
 	if resp.Header.Get("X-Dat9-IsDir") != "false" {
 		t.Errorf("expected X-Dat9-IsDir false, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+}
+
+func TestV2PresignBatchEmitsTelemetryHeaders(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	initiateReqBody := []byte(`{"path":"/presign-telemetry.bin","total_size":20971520}`)
+	resp, err := http.Post(ts.URL+"/v2/uploads/initiate", "application/json", bytes.NewReader(initiateReqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("initiate status = %d, body = %s", resp.StatusCode, string(body))
+	}
+	var plan struct {
+		UploadID string `json:"upload_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.UploadID == "" {
+		t.Fatal("empty upload id")
+	}
+
+	presignReqBody := []byte(`{"parts":[{"part_number":1},{"part_number":2}]}`)
+	resp, err = http.Post(ts.URL+"/v2/uploads/"+plan.UploadID+"/presign-batch", "application/json", bytes.NewReader(presignReqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("presign-batch status = %d, body = %s", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get(presignBatchSizeHeader); got != "2" {
+		t.Fatalf("batch size header = %q, want %q", got, "2")
+	}
+	elapsedMs, err := strconv.ParseFloat(resp.Header.Get(presignElapsedMsHeader), 64)
+	if err != nil {
+		t.Fatalf("parse %s: %v", presignElapsedMsHeader, err)
+	}
+	if elapsedMs < 0 {
+		t.Fatalf("%s = %f, want >= 0", presignElapsedMsHeader, elapsedMs)
 	}
 }
 

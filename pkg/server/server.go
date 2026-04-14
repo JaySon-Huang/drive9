@@ -62,6 +62,11 @@ var (
 	schemaInitMaxBackoff     = 30 * time.Second
 )
 
+const (
+	presignBatchSizeHeader = "X-Dat9-Presign-Batch-Size"
+	presignElapsedMsHeader = "X-Dat9-Presign-Elapsed-Ms"
+)
+
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
 // Keep callers on this exported constant so the default stays consistent.
 const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
@@ -1422,6 +1427,7 @@ func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, up
 		errJSON(w, http.StatusBadRequest, "parts must not be empty")
 		return
 	}
+	start := time.Now()
 	urls, err := b.PresignParts(r.Context(), uploadID, req.Parts)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
@@ -1444,6 +1450,8 @@ func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, up
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_ok", "upload_id", uploadID, "count", len(urls))...)
 	metricEvent(r.Context(), "v2_presign_batch", "result", "ok")
+	w.Header().Set(presignBatchSizeHeader, strconv.Itoa(len(req.Parts)))
+	w.Header().Set(presignElapsedMsHeader, strconv.FormatFloat(float64(time.Since(start))/float64(time.Millisecond), 'f', 3, 64))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"parts": urls})
 }

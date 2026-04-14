@@ -423,14 +423,16 @@ func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
 				},
 			})
 
-		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-multi/presign-batch":
-			if err := json.NewDecoder(r.Body).Decode(&presignReq); err != nil {
-				http.Error(w, "bad json", http.StatusBadRequest)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(struct {
-				Parts []presignedPart `json:"parts"`
-			}{
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-multi/presign-batch":
+				if err := json.NewDecoder(r.Body).Decode(&presignReq); err != nil {
+					http.Error(w, "bad json", http.StatusBadRequest)
+					return
+				}
+				w.Header().Set(presignBatchSizeHeader, "3")
+				w.Header().Set(presignElapsedMsHeader, "750")
+				_ = json.NewEncoder(w).Encode(struct {
+					Parts []presignedPart `json:"parts"`
+				}{
 				Parts: []presignedPart{
 					{Number: 1, URL: fmt.Sprintf("http://%s/v2parts/1", r.Host), Size: 5, ExpiresAt: time.Now().Add(time.Minute)},
 					{Number: 2, URL: fmt.Sprintf("http://%s/v2parts/2", r.Host), Size: 5, ExpiresAt: time.Now().Add(time.Minute)},
@@ -470,14 +472,14 @@ func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
 
 	c := New(srv.URL, "")
 	c.smallFileThreshold = 1
-	err := c.WriteStream(context.Background(), "/v2-multi.bin", bytes.NewReader([]byte("abcdefghijkl")), 12,
+	summary, err := c.WriteStreamWithSummary(context.Background(), "/v2-multi.bin", bytes.NewReader([]byte("abcdefghijkl")), 12,
 		func(partNum, total int, bytesUploaded int64) {
 			mu.Lock()
 			progressCalls = append(progressCalls, [2]int{partNum, total})
 			mu.Unlock()
 		})
 	if err != nil {
-		t.Fatalf("WriteStream: %v", err)
+		t.Fatalf("WriteStreamWithSummary: %v", err)
 	}
 	if sawV1.Load() {
 		t.Fatal("unexpected v1 fallback during v2 multipart upload")
@@ -508,6 +510,27 @@ func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
 	}
 	if len(progressCalls) != 3 {
 		t.Fatalf("progress calls = %v, want 3 calls", progressCalls)
+	}
+	if summary == nil {
+		t.Fatal("summary is nil")
+	}
+	if summary.PresignBatchRequests != 1 {
+		t.Fatalf("summary.PresignBatchRequests = %d, want 1", summary.PresignBatchRequests)
+	}
+	if summary.PresignBatchPartsTotal != 3 {
+		t.Fatalf("summary.PresignBatchPartsTotal = %d, want 3", summary.PresignBatchPartsTotal)
+	}
+	if summary.MaxPresignBatchSize != 3 {
+		t.Fatalf("summary.MaxPresignBatchSize = %d, want 3", summary.MaxPresignBatchSize)
+	}
+	if summary.ServerPresignObservedBatches != 1 {
+		t.Fatalf("summary.ServerPresignObservedBatches = %d, want 1", summary.ServerPresignObservedBatches)
+	}
+	if summary.ServerPresignReportedSeconds != 0.75 {
+		t.Fatalf("summary.ServerPresignReportedSeconds = %f, want 0.75", summary.ServerPresignReportedSeconds)
+	}
+	if summary.ServerPresignReportedSecondsPerPart != 0.25 {
+		t.Fatalf("summary.ServerPresignReportedSecondsPerPart = %f, want 0.25", summary.ServerPresignReportedSecondsPerPart)
 	}
 }
 
