@@ -628,6 +628,98 @@ func TestWriteStreamV2RePresignsExpiredPart(t *testing.T) {
 	}
 }
 
+func TestWriteStreamV2UsesPresignWindowLargerThanUploadParallelism(t *testing.T) {
+	const totalParts = 17
+	partSize := int64(1)
+	var presignBatchSizes []int
+	var putCount atomic.Int32
+	var completeCalled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-window",
+				PartSize:   partSize,
+				TotalParts: totalParts,
+				ChecksumContract: checksumContract{
+					Supported: []string{"SHA-256"},
+				},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-window/presign-batch":
+			var req struct {
+				Parts []struct {
+					PartNumber int `json:"part_number"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			presignBatchSizes = append(presignBatchSizes, len(req.Parts))
+			parts := make([]presignedPart, 0, len(req.Parts))
+			for _, part := range req.Parts {
+				parts = append(parts, presignedPart{
+					Number:    part.PartNumber,
+					URL:       fmt.Sprintf("http://%s/v2parts/%d", r.Host, part.PartNumber),
+					Size:      1,
+					ExpiresAt: time.Now().Add(time.Minute),
+				})
+			}
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{Parts: parts})
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v2parts/"):
+			_, _ = io.Copy(io.Discard, r.Body)
+			putCount.Add(1)
+			w.Header().Set("ETag", `"etag"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-window/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	summary, err := c.WriteStreamWithSummary(context.Background(), "/v2-window.bin", bytes.NewReader([]byte("abcdefghijklmnopq")), totalParts, nil)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummary: %v", err)
+	}
+	if len(presignBatchSizes) != 1 {
+		t.Fatalf("presign batch request count = %d, want 1", len(presignBatchSizes))
+	}
+	if presignBatchSizes[0] != totalParts {
+		t.Fatalf("presign batch size = %d, want %d", presignBatchSizes[0], totalParts)
+	}
+	if got := int(putCount.Load()); got != totalParts {
+		t.Fatalf("put count = %d, want %d", got, totalParts)
+	}
+	if !completeCalled.Load() {
+		t.Fatal("complete was not called")
+	}
+	if summary == nil {
+		t.Fatal("summary is nil")
+	}
+	if summary.Parallelism != uploadMaxConcurrency {
+		t.Fatalf("summary.Parallelism = %d, want %d", summary.Parallelism, uploadMaxConcurrency)
+	}
+	if summary.PresignBatchRequests != 1 {
+		t.Fatalf("summary.PresignBatchRequests = %d, want 1", summary.PresignBatchRequests)
+	}
+	if summary.MaxPresignBatchSize != totalParts {
+		t.Fatalf("summary.MaxPresignBatchSize = %d, want %d", summary.MaxPresignBatchSize, totalParts)
+	}
+}
+
 func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
 	var mu sync.Mutex
 	uploadedParts := map[string][]byte{}

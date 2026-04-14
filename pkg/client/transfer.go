@@ -88,6 +88,10 @@ const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding m
 const (
 	uploadMaxConcurrency = 16
 	uploadMaxBufferBytes = 256 * 1024 * 1024 // 256 MB
+	// Keep client-side presign prefetch larger than upload parallelism so the
+	// baseline 1 GiB / 8 MiB upload can fetch all 128 presigned URLs in one
+	// round, while staying comfortably below the server's current batch ceiling.
+	uploadV2PresignWindow = 128
 )
 
 const (
@@ -213,6 +217,13 @@ func newUploadBufferPool(bufferSize int64, count int) *uploadBufferPool {
 		ch <- make([]byte, bufferSize)
 	}
 	return &uploadBufferPool{size: bufferSize, ch: ch}
+}
+
+func uploadV2PresignBatchSize(totalParts int) int {
+	if totalParts <= 0 {
+		return 1
+	}
+	return min(totalParts, uploadV2PresignWindow)
 }
 
 func (p *uploadBufferPool) get(ctx context.Context) ([]byte, error) {
@@ -406,13 +417,14 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 
 	// Pipelined presign: feed presigned URLs into a buffered channel.
 	parallelism := uploadParallelism(plan.PartSize)
+	presignBatchSize := uploadV2PresignBatchSize(plan.TotalParts)
 	presignCh := make(chan presignedPart, parallelism)
 	presignErrCh := make(chan error, 1)
 	presignStatsCh := make(chan presignPipelineStats, 1)
 
 	go func() {
 		start := time.Now()
-		stats := c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
+		stats := c.presignPipeline(ctx, plan, presignBatchSize, presignCh, presignErrCh)
 		if summary != nil {
 			summary.PresignSeconds = time.Since(start).Seconds()
 		}
