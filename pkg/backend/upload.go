@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -46,6 +48,8 @@ const MaxMultipartParts = 10000
 
 // MaxPresignBatch is the maximum number of parts that can be presigned in a single batch request.
 const MaxPresignBatch = 500
+
+const presignPartsMaxConcurrency = 16
 
 // PresignChecksum is an optional checksum for a presign request (algorithm-neutral wire format).
 type PresignChecksum struct {
@@ -487,8 +491,7 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 	}
 
 	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
-
-	urls := make([]*s3client.UploadPartURL, len(entries))
+	reqs := make([]presignPartRequest, len(entries))
 	for i, e := range entries {
 		pn := e.PartNumber
 		if pn < 1 || pn > upload.PartsTotal {
@@ -501,16 +504,119 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
 			return nil, err
 		}
-		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, pn, partSize, s3client.ChecksumAlgoSHA256, checksumSHA256, s3client.UploadTTL)
-		if err != nil {
-			logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", pn), zap.Error(err))
-			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-			return nil, fmt.Errorf("presign part %d: %w", pn, err)
+		reqs[i] = presignPartRequest{
+			index:      i,
+			partNumber: pn,
+			partSize:   partSize,
+			checksum:   checksumSHA256,
 		}
-		urls[i] = u
+	}
+
+	urls, err := presignPartsConcurrent(ctx, b.s3, upload.S3Key, upload.S3UploadID, reqs)
+	if err != nil {
+		partNumber := 0
+		var partErr *presignPartError
+		if errors.As(err, &partErr) {
+			partNumber = partErr.partNumber
+			err = partErr.err
+		}
+		logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", partNumber), zap.Error(err))
+		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+		if partNumber > 0 {
+			return nil, fmt.Errorf("presign part %d: %w", partNumber, err)
+		}
+		return nil, err
 	}
 	metrics.RecordOperation("backend", "presign_parts", "ok", time.Since(start))
 	return urls, nil
+}
+
+type presignPartRequest struct {
+	index      int
+	partNumber int
+	partSize   int64
+	checksum   string
+}
+
+type presignPartError struct {
+	partNumber int
+	err        error
+}
+
+func (e *presignPartError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *presignPartError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func presignPartsConcurrent(ctx context.Context, s3c s3client.S3Client, key, uploadID string, reqs []presignPartRequest) ([]*s3client.UploadPartURL, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+
+	workerCount := min(len(reqs), min(runtime.GOMAXPROCS(0), presignPartsMaxConcurrency))
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]*s3client.UploadPartURL, len(reqs))
+	jobs := make(chan presignPartRequest)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	worker := func() {
+		defer wg.Done()
+		for req := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			u, err := s3c.PresignUploadPart(ctx, key, uploadID, req.partNumber, req.partSize, s3client.ChecksumAlgoSHA256, req.checksum, s3client.UploadTTL)
+			if err != nil {
+				once.Do(func() {
+					firstErr = &presignPartError{partNumber: req.partNumber, err: err}
+					cancel()
+				})
+				return
+			}
+			results[req.index] = u
+		}
+	}
+
+	for range workerCount {
+		wg.Add(1)
+		go worker()
+	}
+
+sendLoop:
+	for _, req := range reqs {
+		select {
+		case <-ctx.Done():
+			break sendLoop
+		case jobs <- req:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		return nil, err
+	}
+	return results, nil
 }
 
 // CompletePart is a client-supplied part reference for v2 complete.

@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +26,90 @@ func entriesFromInts(nums []int) []PresignPartEntry {
 		entries[i] = PresignPartEntry{PartNumber: n}
 	}
 	return entries
+}
+
+type fakePresignS3Client struct {
+	delay           time.Duration
+	failPart        int
+	mu              sync.Mutex
+	callOrder       []int
+	maxInFlight     int32
+	currentInFlight int32
+}
+
+func (f *fakePresignS3Client) CreateMultipartUpload(ctx context.Context, key string, algo s3client.ChecksumAlgo) (*s3client.MultipartUpload, error) {
+	return nil, fmt.Errorf("unexpected CreateMultipartUpload call")
+}
+
+func (f *fakePresignS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo s3client.ChecksumAlgo, checksumValue string, ttl time.Duration) (*s3client.UploadPartURL, error) {
+	inFlight := atomic.AddInt32(&f.currentInFlight, 1)
+	defer atomic.AddInt32(&f.currentInFlight, -1)
+
+	for {
+		maxSeen := atomic.LoadInt32(&f.maxInFlight)
+		if inFlight <= maxSeen {
+			break
+		}
+		if atomic.CompareAndSwapInt32(&f.maxInFlight, maxSeen, inFlight) {
+			break
+		}
+	}
+
+	f.mu.Lock()
+	f.callOrder = append(f.callOrder, partNumber)
+	f.mu.Unlock()
+
+	if f.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(f.delay):
+		}
+	}
+	if partNumber == f.failPart {
+		return nil, fmt.Errorf("boom part %d", partNumber)
+	}
+	return &s3client.UploadPartURL{
+		Number: partNumber,
+		URL:    fmt.Sprintf("https://example.invalid/%d", partNumber),
+		Size:   partSize,
+	}, nil
+}
+
+func (f *fakePresignS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []s3client.Part) error {
+	return fmt.Errorf("unexpected CompleteMultipartUpload call")
+}
+
+func (f *fakePresignS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	return fmt.Errorf("unexpected AbortMultipartUpload call")
+}
+
+func (f *fakePresignS3Client) ListParts(ctx context.Context, key, uploadID string) ([]s3client.Part, error) {
+	return nil, fmt.Errorf("unexpected ListParts call")
+}
+
+func (f *fakePresignS3Client) PresignGetObject(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	return "", fmt.Errorf("unexpected PresignGetObject call")
+}
+
+func (f *fakePresignS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
+	return fmt.Errorf("unexpected PutObject call")
+}
+
+func (f *fakePresignS3Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("unexpected GetObject call")
+}
+
+func (f *fakePresignS3Client) DeleteObject(ctx context.Context, key string) error {
+	return fmt.Errorf("unexpected DeleteObject call")
+}
+
+func (f *fakePresignS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
+	return "", fmt.Errorf("unexpected UploadPartCopy call")
+}
+
+func (f *fakePresignS3Client) PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error) {
+	return "", fmt.Errorf("unexpected PresignGetObjectRange call")
 }
 
 func newTestBackendWithS3(t *testing.T) *Dat9Backend {
@@ -417,6 +505,69 @@ func TestPresignPartsBatch(t *testing.T) {
 	upload, _ := b.GetUpload(ctx, plan.UploadID)
 	if upload.Status != datastore.UploadUploading {
 		t.Errorf("expected UPLOADING, got %s", upload.Status)
+	}
+}
+
+func TestPresignPartsConcurrentPreservesOrder(t *testing.T) {
+	reqs := []presignPartRequest{
+		{index: 0, partNumber: 1, partSize: 11},
+		{index: 1, partNumber: 2, partSize: 22},
+		{index: 2, partNumber: 3, partSize: 33},
+	}
+	fake := &fakePresignS3Client{delay: 10 * time.Millisecond}
+
+	urls, err := presignPartsConcurrent(context.Background(), fake, "key", "upload", reqs)
+	if err != nil {
+		t.Fatalf("presignPartsConcurrent: %v", err)
+	}
+	if len(urls) != len(reqs) {
+		t.Fatalf("url count = %d, want %d", len(urls), len(reqs))
+	}
+	for i, u := range urls {
+		if u == nil {
+			t.Fatalf("urls[%d] is nil", i)
+		}
+		if u.Number != reqs[i].partNumber {
+			t.Fatalf("urls[%d].Number = %d, want %d", i, u.Number, reqs[i].partNumber)
+		}
+	}
+}
+
+func TestPresignPartsConcurrentReturnsFirstPartError(t *testing.T) {
+	reqs := []presignPartRequest{
+		{index: 0, partNumber: 1, partSize: 11},
+		{index: 1, partNumber: 2, partSize: 22},
+	}
+	fake := &fakePresignS3Client{failPart: 2}
+
+	_, err := presignPartsConcurrent(context.Background(), fake, "key", "upload", reqs)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var partErr *presignPartError
+	if !errors.As(err, &partErr) {
+		t.Fatalf("expected presignPartError, got %T", err)
+	}
+	if partErr.partNumber != 2 {
+		t.Fatalf("partErr.partNumber = %d, want 2", partErr.partNumber)
+	}
+	if !strings.Contains(partErr.Error(), "boom part 2") {
+		t.Fatalf("unexpected error: %v", partErr)
+	}
+}
+
+func TestPresignPartsConcurrentUsesParallelWorkers(t *testing.T) {
+	reqs := make([]presignPartRequest, 8)
+	for i := range reqs {
+		reqs[i] = presignPartRequest{index: i, partNumber: i + 1, partSize: int64(i + 1)}
+	}
+	fake := &fakePresignS3Client{delay: 20 * time.Millisecond}
+
+	if _, err := presignPartsConcurrent(context.Background(), fake, "key", "upload", reqs); err != nil {
+		t.Fatalf("presignPartsConcurrent: %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.maxInFlight); got <= 1 {
+		t.Fatalf("max in-flight presign calls = %d, want > 1", got)
 	}
 }
 
