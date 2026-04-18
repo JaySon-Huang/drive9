@@ -732,6 +732,46 @@ func TestSemanticWorkerManagerNilWhenMultiTenantOnlyFallbackHasAutoTasks(t *test
 	}
 }
 
+func TestValidateDurableSemanticTasksRequireSemanticWorker(t *testing.T) {
+	semanticText := "semantic_text_format: drive9-file-semantic/v1\npurpose:\n- file\nkey_topics:\n- topic\nimportant_identifiers:\n- ident\nstructure:\n- section\nsemantic_summary:\nsummary"
+
+	t.Run("rejects_text_semantic_without_worker", func(t *testing.T) {
+		err := ValidateDurableSemanticTasksRequireSemanticWorker(Config{}, backend.Options{
+			TextSemantic: backend.TextSemanticOptions{Enabled: true},
+		}, false)
+		if err == nil {
+			t.Fatal("expected validation failure without worker")
+		}
+		if !strings.Contains(err.Error(), "generate_file_semantic_text") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("skips_local_validation_when_auto_embedding_disabled", func(t *testing.T) {
+		err := ValidateDurableSemanticTasksRequireSemanticWorker(Config{}, backend.Options{
+			TextSemantic: backend.TextSemanticOptions{Enabled: true},
+		}, true)
+		if err != nil {
+			t.Fatalf("expected local non-auto template to skip validation, got %v", err)
+		}
+	})
+
+	t.Run("accepts_single_tenant_text_semantic_worker", func(t *testing.T) {
+		opts := backend.Options{
+			DatabaseAutoEmbedding: true,
+			TextSemantic: backend.TextSemanticOptions{
+				Enabled:   true,
+				Generator: staticTextSemanticGenerator{text: semanticText},
+			},
+		}
+		b := newTestBackendForSemanticWorkerWithOptions(t, opts)
+		err := ValidateDurableSemanticTasksRequireSemanticWorker(Config{Backend: b}, opts, true)
+		if err != nil {
+			t.Fatalf("expected viable fallback worker, got %v", err)
+		}
+	})
+}
+
 func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
 	b := newTestBackendForSemanticWorker(t)
 	if _, err := b.Write("/docs/b.txt", []byte("version one"), 0, filesystem.WriteFlagCreate); err != nil {

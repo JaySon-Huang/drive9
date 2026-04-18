@@ -102,9 +102,8 @@ func SemanticWorkerWillRun(cfg Config) bool {
 	return newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers) != nil
 }
 
-// ValidateDurableAsyncExtractRequiresSemanticWorker returns an error when async
-// image or audio extraction runtimes are enabled on the backend template (so
-// durable TiDB-auto semantic tasks may be enqueued for matching tenants) but the
+// ValidateDurableSemanticTasksRequireSemanticWorker returns an error when
+// durable TiDB-auto semantic tasks are enabled on the backend template but the
 // semantic worker would not start for cfg.
 //
 // When localTiDBAutoOnly is true, validation applies only if
@@ -112,10 +111,9 @@ func SemanticWorkerWillRun(cfg Config) bool {
 // embedding mode). When false (drive9-server with a tenant pool), the template
 // may leave DatabaseAutoEmbedding unset because per-tenant backends set it during
 // pool createBackend; in that case validation always runs when a runtime wires.
-func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
-	willWire := backend.AsyncImageExtractWillWireRuntime(template.AsyncImageExtract) ||
-		backend.AsyncAudioExtractWillWireRuntime(template.AsyncAudioExtract)
-	if !willWire {
+func ValidateDurableSemanticTasksRequireSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
+	taskTypes := backend.ConfiguredAutoSemanticTaskTypes(template)
+	if !hasAnyTaskTypes(taskTypes) {
 		return nil
 	}
 	if localTiDBAutoOnly && !template.DatabaseAutoEmbedding {
@@ -124,7 +122,14 @@ func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template back
 	if SemanticWorkerWillRun(cfg) {
 		return nil
 	}
-	return fmt.Errorf("semantic worker would not start but durable async image/audio extract is enabled; configure DRIVE9_EMBED_* for app-managed embedding or fix worker/task-type routing so img_extract_text and audio_extract_text can be claimed")
+	typeNames := strings.Join(semanticWorkerLogTaskTypesFromTypes(taskTypes), ", ")
+	return fmt.Errorf("semantic worker would not start but durable TiDB-auto semantic tasks are enabled (%s); configure DRIVE9_EMBED_* for app-managed embedding or fix worker/task-type routing so these task types can be claimed", typeNames)
+}
+
+// ValidateDurableAsyncExtractRequiresSemanticWorker preserves the old startup
+// validation entrypoint while delegating to the generic semantic-task version.
+func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
+	return ValidateDurableSemanticTasksRequireSemanticWorker(cfg, template, localTiDBAutoOnly)
 }
 
 type semanticWorkerManager struct {

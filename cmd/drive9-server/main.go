@@ -234,12 +234,12 @@ func main() {
 			defer expirySweepWorker.Stop()
 		}
 
-		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
+		// TODO: Run ValidateDurableSemanticTasksRequireSemanticWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
 		// (database auto-embedding: tidb_zero, tidb_cloud_starter). pool != nil is too broad
 		// for db9-only pools, which never hit that path but still get forced to configure
 		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
-		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+		if err := server.ValidateDurableSemanticTasksRequireSemanticWorker(server.Config{
 			Meta:             store,
 			Pool:             pool,
 			Provisioner:      provisioner,
@@ -399,6 +399,11 @@ environment:
   DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required when enabled)
   DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required when enabled)
   DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription
+  File semantic text generation (durable text-like semantic closure; TiDB auto-embedding only):
+  DRIVE9_TEXT_SEMANTIC_ENABLED true|false (default: false)
+  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: 262144)
+  DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: 30)
+  DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: 16384)
 
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
@@ -565,6 +570,18 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 		}
 		logger.Info(context.Background(), "audio_extract_mode_openai_compatible",
 			zap.String("model", audioModel), zap.String("base_url", audioBaseURL))
+	}
+	if envBool("DRIVE9_TEXT_SEMANTIC_ENABLED", false) {
+		opts.TextSemantic = backend.TextSemanticOptions{
+			Enabled:              true,
+			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", 256<<10),
+			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", 30)) * time.Second,
+			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", 16<<10),
+		}
+		logger.Info(context.Background(), "text_semantic_mode_basic_fallback",
+			zap.Int64("max_source_bytes", opts.TextSemantic.MaxSourceBytes),
+			zap.Duration("task_timeout", opts.TextSemantic.TaskTimeout),
+			zap.Int("max_text_bytes", opts.TextSemantic.MaxGenerateTextBytes))
 	}
 	return opts, nil
 }

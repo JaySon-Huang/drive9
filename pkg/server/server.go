@@ -201,7 +201,11 @@ func NewWithConfig(cfg Config) *Server {
 			zap.Strings("fallback_task_types", fallbackTaskTypes),
 			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
+			zap.Bool("fallback_audio_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncAudioExtract()),
+			zap.Bool("fallback_text_semantic_enabled", cfg.Backend != nil && cfg.Backend.SupportsFileSemanticTextGenerate()),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+			zap.Bool("pool_audio_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncAudioExtract()),
+			zap.Bool("pool_text_semantic_enabled", cfg.Pool != nil && cfg.Pool.SupportsFileSemanticTextGenerate()))
 		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
 	} else {
 		logger.Info("server_semantic_workers_disabled",
@@ -211,8 +215,12 @@ func NewWithConfig(cfg Config) *Server {
 			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
 			zap.Bool("fallback_present", cfg.Backend != nil),
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("fallback_audio_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncAudioExtract()),
+			zap.Bool("fallback_text_semantic_enabled", cfg.Backend != nil && cfg.Backend.SupportsFileSemanticTextGenerate()),
 			zap.Bool("pool_present", cfg.Pool != nil),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+			zap.Bool("pool_audio_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncAudioExtract()),
+			zap.Bool("pool_text_semantic_enabled", cfg.Pool != nil && cfg.Pool.SupportsFileSemanticTextGenerate()))
 	}
 	return s
 }

@@ -197,9 +197,32 @@ func (b *Dat9Backend) hasAsyncImageTextSource(path, contentType string) bool {
 	return isImageContentType(contentTypeFromPath(path))
 }
 
+// ConfiguredAutoSemanticTaskTypes returns the durable semantic task types
+// implied by backend options before a Dat9Backend instance is constructed.
+//
+// This keeps startup validation, tenant-pool coarse routing, and per-backend
+// capability exposure aligned on the same runtime viability checks.
+func ConfiguredAutoSemanticTaskTypes(opts Options) []semantic.TaskType {
+	var out []semantic.TaskType
+	if AsyncImageExtractWillWireRuntime(opts.AsyncImageExtract) {
+		out = append(out, semantic.TaskTypeImgExtractText)
+	}
+	if AsyncAudioExtractWillWireRuntime(opts.AsyncAudioExtract) {
+		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	if TextSemanticWillWireRuntime(opts.TextSemantic) {
+		out = append(out, semantic.TaskTypeGenerateFileSemanticText)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // AutoSemanticTaskTypes returns durable semantic task types executed on the
 // database auto-embedding (TiDB auto) path: img_extract_text and/or
-// audio_extract_text when the corresponding async runtimes are configured.
+// audio_extract_text and/or generate_file_semantic_text when the corresponding
+// async runtimes are configured.
 //
 // It does not include app-managed embed work; embed routing uses the worker
 // embedder, not the backend. A nil return means this backend contributes no
@@ -208,18 +231,9 @@ func (b *Dat9Backend) AutoSemanticTaskTypes() []semantic.TaskType {
 	if b == nil || !b.UsesDatabaseAutoEmbedding() {
 		return nil
 	}
-	var out []semantic.TaskType
-	if b.SupportsAsyncImageExtract() {
-		out = append(out, semantic.TaskTypeImgExtractText)
-	}
-	if b.SupportsAsyncAudioExtract() {
-		out = append(out, semantic.TaskTypeAudioExtractText)
-	}
-	if b.SupportsFileSemanticTextGenerate() {
-		out = append(out, semantic.TaskTypeGenerateFileSemanticText)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return ConfiguredAutoSemanticTaskTypes(Options{
+		AsyncImageExtract: AsyncImageExtractOptions{Enabled: b.SupportsAsyncImageExtract()},
+		AsyncAudioExtract: AsyncAudioExtractOptions{Enabled: b.SupportsAsyncAudioExtract(), Extractor: b.audioExtractor},
+		TextSemantic:      TextSemanticOptions{Enabled: b.SupportsFileSemanticTextGenerate(), Generator: b.textSemanticGenerator},
+	})
 }

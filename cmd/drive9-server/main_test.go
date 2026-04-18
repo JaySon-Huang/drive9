@@ -118,6 +118,70 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	}
 }
 
+func TestBuildBackendOptionsFromEnvTextSemanticDisabled(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if backend.TextSemanticWillWireRuntime(opts.TextSemantic) {
+		t.Fatalf("expected text semantic runtime disabled, got %+v", opts.TextSemantic)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvTextSemanticEnabled(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_ENABLED", "true")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", "4096")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", "12")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", "2048")
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if !backend.TextSemanticWillWireRuntime(opts.TextSemantic) {
+		t.Fatalf("expected text semantic runtime wired, got %+v", opts.TextSemantic)
+	}
+	if opts.TextSemantic.MaxSourceBytes != 4096 {
+		t.Fatalf("MaxSourceBytes=%d, want 4096", opts.TextSemantic.MaxSourceBytes)
+	}
+	if got := opts.TextSemantic.TaskTimeout.Seconds(); got != 12 {
+		t.Fatalf("TaskTimeout=%v, want 12s", opts.TextSemantic.TaskTimeout)
+	}
+	if opts.TextSemantic.MaxGenerateTextBytes != 2048 {
+		t.Fatalf("MaxGenerateTextBytes=%d, want 2048", opts.TextSemantic.MaxGenerateTextBytes)
+	}
+}
+
 func TestS3ConfigFromEnv(t *testing.T) {
 	keys := []string{
 		"DRIVE9_S3_DIR",
