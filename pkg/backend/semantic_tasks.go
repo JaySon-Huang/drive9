@@ -71,6 +71,16 @@ func (b *Dat9Backend) shouldEnqueueAudioExtractTask(path, contentType string) bo
 	return isSupportedAudioForSemanticTask(path, contentType)
 }
 
+// SupportsFileSemanticTextGenerate reports whether this backend instance
+// advertises durable file-level semantic text generation on the TiDB
+// auto-embedding path.
+//
+// Commit 1 lands the typed task contract and routing seam first. Runtime wiring
+// remains a follow-up, so the effective enablement still defaults to false.
+func (b *Dat9Backend) SupportsFileSemanticTextGenerate() bool {
+	return b != nil && b.fileSemanticTaskEnabled
+}
+
 func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semantic.Task {
 	now = now.UTC()
 	return &semantic.Task{
@@ -170,6 +180,9 @@ func (b *Dat9Backend) AutoSemanticTaskTypes() []semantic.TaskType {
 	}
 	if b.SupportsAsyncAudioExtract() {
 		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	if b.SupportsFileSemanticTextGenerate() {
+		out = append(out, semantic.TaskTypeGenerateFileSemanticText)
 	}
 	if len(out) == 0 {
 		return nil

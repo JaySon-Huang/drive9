@@ -20,6 +20,14 @@ type AudioExtractTaskPayload struct {
 	ContentType string `json:"content_type,omitempty"`
 }
 
+// FileSemanticTaskPayload carries non-authoritative hints for durable
+// file-level semantic text generation. The task identity remains resource_id +
+// resource_version.
+type FileSemanticTaskPayload struct {
+	Path        string `json:"path,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
 // TaskType identifies the durable semantic work to execute.
 type TaskType string
 
@@ -30,6 +38,9 @@ const (
 	TaskTypeImgExtractText TaskType = "img_extract_text"
 	// TaskTypeAudioExtractText extracts or refreshes audio-derived file content_text.
 	TaskTypeAudioExtractText TaskType = "audio_extract_text"
+	// TaskTypeGenerateFileSemanticText generates retrieval-oriented file-level
+	// semantic text for large or sync-insufficient direct-text files.
+	TaskTypeGenerateFileSemanticText TaskType = "generate_file_semantic_text"
 	// TaskTypeGenerateL0 generates or refreshes .abstract.md style summaries.
 	TaskTypeGenerateL0 TaskType = "generate_l0"
 	// TaskTypeGenerateL1 generates or refreshes .overview.md style summaries.

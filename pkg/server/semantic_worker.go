@@ -649,9 +649,19 @@ func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semant
 		return m.processImgExtractTask(ctx, target.backend, task)
 	case semantic.TaskTypeAudioExtractText:
 		return m.processAudioExtractTask(ctx, target.backend, task)
+	case semantic.TaskTypeGenerateFileSemanticText:
+		return m.processFileSemanticTask(ctx, target.backend, task)
 	default:
 		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
+	}
+}
+
+func (m *semanticWorkerManager) processFileSemanticTask(_ context.Context, _ *backend.Dat9Backend, _ *semantic.Task) semanticTaskOutcome {
+	return semanticTaskOutcome{
+		action:  semanticTaskActionRetry,
+		result:  "runtime_not_configured",
+		message: "file semantic task handler is not wired yet",
 	}
 }
 

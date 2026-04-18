@@ -157,6 +157,14 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 			t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", got)
 		}
 	})
+	t.Run("auto_mode_with_file_semantic_task_contract", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+		b.fileSemanticTaskEnabled = true
+		got := b.AutoSemanticTaskTypes()
+		if len(got) != 1 || got[0] != semantic.TaskTypeGenerateFileSemanticText {
+			t.Fatalf("got %#v, want [generate_file_semantic_text]", got)
+		}
+	})
 }
 
 func TestWriteAndRead(t *testing.T) {
