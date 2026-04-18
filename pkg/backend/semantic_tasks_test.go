@@ -260,8 +260,10 @@ func TestWriteCreateAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
 }
 
 func TestWriteCreateAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *testing.T) {
-	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
-	b.fileSemanticTaskEnabled = true
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		TextSemantic:          TextSemanticOptions{Enabled: true},
+	})
 
 	data := repeatedTextBytes(smallFileThreshold + 256)
 	if _, err := b.Write("/docs/large.txt", data, 0, filesystem.WriteFlagCreate); err != nil {
@@ -292,8 +294,10 @@ func TestWriteCreateAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *test
 }
 
 func TestWriteCreateAutoEmbeddingSmallDirectTextKeepsSyncOwnership(t *testing.T) {
-	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
-	b.fileSemanticTaskEnabled = true
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		TextSemantic:          TextSemanticOptions{Enabled: true},
+	})
 
 	if _, err := b.Write("/docs/small.txt", []byte("hello semantic world"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
@@ -313,8 +317,10 @@ func TestWriteCreateAutoEmbeddingSmallDirectTextKeepsSyncOwnership(t *testing.T)
 }
 
 func TestOverwriteAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *testing.T) {
-	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
-	b.fileSemanticTaskEnabled = true
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		TextSemantic:          TextSemanticOptions{Enabled: true},
+	})
 
 	if _, err := b.Write("/docs/overwrite.txt", []byte("seed"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
@@ -846,8 +852,10 @@ func TestConfirmUploadAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue
 }
 
 func TestConfirmUploadAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *testing.T) {
-	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
-	b.fileSemanticTaskEnabled = true
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		TextSemantic:          TextSemanticOptions{Enabled: true},
+	})
 
 	ctx := context.Background()
 	totalSize := int64(smallFileThreshold + 512)

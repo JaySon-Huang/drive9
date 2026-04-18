@@ -12,17 +12,20 @@ import (
 )
 
 const (
-	defaultImageExtractQueueSize = 128
-	defaultImageExtractWorkers   = 1
-	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
-	defaultImageExtractTimeout   = 20 * time.Second
-	defaultMaxExtractedTextBytes = 8 << 10               // 8 KiB
-	defaultAudioExtractMaxSize   = int64(32 << 20)       // 32 MiB
-	defaultAudioExtractTimeout   = 2 * time.Minute
+	defaultImageExtractQueueSize      = 128
+	defaultImageExtractWorkers        = 1
+	defaultImageExtractMaxSize        = int64(8 << 20) // 8 MiB
+	defaultImageExtractTimeout        = 20 * time.Second
+	defaultMaxExtractedTextBytes      = 8 << 10         // 8 KiB
+	defaultAudioExtractMaxSize        = int64(32 << 20) // 32 MiB
+	defaultAudioExtractTimeout        = 2 * time.Minute
 	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
-	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
-	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
-	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
+	defaultTextSemanticMaxSourceBytes = int64(256 << 10) // 256 KiB
+	defaultTextSemanticTimeout        = 30 * time.Second
+	defaultMaxTextSemanticTextBytes   = 16 << 10              // 16 KiB
+	defaultMaxUploadBytes             = int64(10 * (1 << 30)) // 10 GiB
+	defaultMaxTenantStorageBytes      = int64(50 * (1 << 30)) // 50 GiB
+	defaultMaxMediaLLMFiles           = int64(500)            // 500 media files per tenant
 )
 
 // QuotaSource controls where quota checks read authoritative state from.
@@ -46,8 +49,11 @@ type Options struct {
 	// TiDB auto-embedding path. Unlike async image extract, there is no in-process
 	// queue; work is delivered only via semantic_tasks when runtime is wired.
 	AsyncAudioExtract AsyncAudioExtractOptions
-	QueryEmbedding    QueryEmbeddingOptions
-	MaxUploadBytes    int64
+	// TextSemantic configures durable file-level semantic text generation for
+	// large or sync-insufficient direct-text files on the TiDB auto-embedding path.
+	TextSemantic   TextSemanticOptions
+	QueryEmbedding QueryEmbeddingOptions
+	MaxUploadBytes int64
 	// MaxTenantStorageBytes caps the total logical storage a single tenant may
 	// occupy across confirmed files plus in-flight upload reservations.
 	MaxTenantStorageBytes int64
@@ -122,6 +128,21 @@ type AsyncAudioExtractOptions struct {
 // default extractor: both Enabled and a non-nil Extractor are required.
 func AsyncAudioExtractWillWireRuntime(opts AsyncAudioExtractOptions) bool {
 	return opts.Enabled && opts.Extractor != nil
+}
+
+// TextSemanticOptions configures durable file-level semantic text generation.
+type TextSemanticOptions struct {
+	Enabled              bool
+	MaxSourceBytes       int64
+	TaskTimeout          time.Duration
+	MaxGenerateTextBytes int
+	Generator            TextSemanticGenerator
+}
+
+// TextSemanticWillWireRuntime reports whether file-level text semantic
+// generation will be wired on a Dat9Backend built from opts.
+func TextSemanticWillWireRuntime(opts TextSemanticOptions) bool {
+	return opts.Enabled
 }
 
 // QueryEmbeddingOptions controls app-side query embedding for semantic search.
@@ -233,6 +254,32 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 			zap.Int64("max_audio_bytes", a.MaxAudioBytes),
 			zap.Int("max_extract_text_bytes", a.MaxExtractTextBytes),
 			zap.String("extractor_type", fmt.Sprintf("%T", a.Extractor)))
+	}
+
+	t := opts.TextSemantic
+	if TextSemanticWillWireRuntime(t) {
+		if t.MaxSourceBytes <= 0 {
+			t.MaxSourceBytes = defaultTextSemanticMaxSourceBytes
+		}
+		if t.TaskTimeout <= 0 {
+			t.TaskTimeout = defaultTextSemanticTimeout
+		}
+		if t.MaxGenerateTextBytes <= 0 {
+			t.MaxGenerateTextBytes = defaultMaxTextSemanticTextBytes
+		}
+		if t.Generator == nil {
+			t.Generator = NewBasicTextSemanticGenerator()
+		}
+		b.textSemanticEnabled = true
+		b.textSemanticGenerator = t.Generator
+		b.textSemanticTimeout = t.TaskTimeout
+		b.textSemanticMaxSourceBytes = t.MaxSourceBytes
+		b.maxTextSemanticTextBytes = t.MaxGenerateTextBytes
+		logger.Info(backgroundWithTrace(), "backend_text_semantic_runtime_configured",
+			zap.Duration("task_timeout", t.TaskTimeout),
+			zap.Int64("max_source_bytes", t.MaxSourceBytes),
+			zap.Int("max_generate_text_bytes", t.MaxGenerateTextBytes),
+			zap.String("generator_type", fmt.Sprintf("%T", t.Generator)))
 	}
 }
 

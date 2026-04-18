@@ -70,7 +70,11 @@ type Dat9Backend struct {
 	maxAudioExtractTextBytes int
 
 	// File-level semantic text generation for large direct-text files.
-	fileSemanticTaskEnabled bool
+	textSemanticEnabled        bool
+	textSemanticGenerator      TextSemanticGenerator
+	textSemanticTimeout        time.Duration
+	textSemanticMaxSourceBytes int64
+	maxTextSemanticTextBytes   int
 
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64

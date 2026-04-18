@@ -657,12 +657,12 @@ func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semant
 	}
 }
 
-func (m *semanticWorkerManager) processFileSemanticTask(_ context.Context, _ *backend.Dat9Backend, _ *semantic.Task) semanticTaskOutcome {
-	return semanticTaskOutcome{
-		action:  semanticTaskActionRetry,
-		result:  "runtime_not_configured",
-		message: "file semantic task handler is not wired yet",
+func (m *semanticWorkerManager) processFileSemanticTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
+	result, err := b.ProcessFileSemanticTask(ctx, textSemanticTaskSpecFromSemanticTask(task))
+	if err != nil {
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result)}
 }
 
 func (m *semanticWorkerManager) startTaskLeaseExecution(ctx context.Context, target *semanticTarget, task *semantic.Task) *semanticTaskLeaseExecution {
@@ -1137,6 +1137,22 @@ func audioExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.AudioExtr
 		return spec
 	}
 	var payload semantic.AudioExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
+		spec.Path = payload.Path
+		spec.ContentType = payload.ContentType
+	}
+	return spec
+}
+
+func textSemanticTaskSpecFromSemanticTask(task *semantic.Task) backend.TextSemanticTaskSpec {
+	if task == nil {
+		return backend.TextSemanticTaskSpec{}
+	}
+	spec := backend.TextSemanticTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	if len(task.PayloadJSON) == 0 {
+		return spec
+	}
+	var payload semantic.FileSemanticTaskPayload
 	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
 		spec.Path = payload.Path
 		spec.ContentType = payload.ContentType
