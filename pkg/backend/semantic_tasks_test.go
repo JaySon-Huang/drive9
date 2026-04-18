@@ -105,6 +105,18 @@ func mustFileForPath(t *testing.T, b *Dat9Backend, path string) (string, int64, 
 	return nf.File.FileID, nf.File.Revision, nf.File.EmbeddingRevision, nf.File.ContentType
 }
 
+func repeatedTextBytes(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+	chunk := []byte("package main\n\nfunc example() string {\n\treturn \"semantic search\"\n}\n")
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+	for buf.Len() < size {
+		_, _ = buf.Write(chunk)
+	}
+	return buf.Bytes()[:size]
+}
+
 func TestWriteCreateEnqueuesEmbedTask(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/data/file.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -244,6 +256,90 @@ func TestWriteCreateAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
 	}
 	if nf.File.ContentText != "" {
 		t.Fatalf("content_text should be empty before worker, got %q", nf.File.ContentText)
+	}
+}
+
+func TestWriteCreateAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	b.fileSemanticTaskEnabled = true
+
+	data := repeatedTextBytes(smallFileThreshold + 256)
+	if _, err := b.Write("/docs/large.txt", data, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/docs/large.txt")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if stripMIMEParams(contentType) != "text/plain" {
+		t.Fatalf("content_type=%q, want text/plain-compatible", contentType)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/docs/large.txt")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /docs/large.txt: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeGenerateFileSemanticText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestWriteCreateAutoEmbeddingSmallDirectTextKeepsSyncOwnership(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	b.fileSemanticTaskEnabled = true
+
+	if _, err := b.Write("/docs/small.txt", []byte("hello semantic world"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID, _, _, _ := mustFileForPath(t, b, "/docs/small.txt")
+	nf, err := b.Store().Stat(context.Background(), "/docs/small.txt")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /docs/small.txt: %v", err)
+	}
+	if nf.File.ContentText != "hello semantic world" {
+		t.Fatalf("content_text=%q, want sync extracted text", nf.File.ContentText)
+	}
+	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
+func TestOverwriteAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	b.fileSemanticTaskEnabled = true
+
+	if _, err := b.Write("/docs/overwrite.txt", []byte("seed"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	data := repeatedTextBytes(smallFileThreshold + 128)
+	if _, err := b.Write("/docs/overwrite.txt", data, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID, revision, _, _ := mustFileForPath(t, b, "/docs/overwrite.txt")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var fileSemanticSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeGenerateFileSemanticText) && tsk.ResourceVersion == 2 {
+			fileSemanticSeen = true
+			if tsk.Status != string(semantic.TaskQueued) {
+				t.Fatalf("unexpected file semantic task: %+v", tsk)
+			}
+		}
+	}
+	if !fileSemanticSeen {
+		t.Fatalf("expected generate_file_semantic_text among %+v", tasks)
 	}
 }
 
@@ -745,6 +841,44 @@ func TestConfirmUploadAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue
 		t.Fatalf("semantic task count=%d, want 1", len(tasks))
 	}
 	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingLargeDirectTextEnqueuesFileSemanticTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	b.fileSemanticTaskEnabled = true
+
+	ctx := context.Background()
+	totalSize := int64(smallFileThreshold + 512)
+	plan, err := b.InitiateUpload(ctx, "/upload/large.txt", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/upload/large.txt")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if stripMIMEParams(contentType) != "text/plain" {
+		t.Fatalf("content_type=%q, want text/plain-compatible", contentType)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/upload/large.txt")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /upload/large.txt: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeGenerateFileSemanticText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
 		t.Fatalf("unexpected semantic task: %+v", tasks[0])
 	}
 }

@@ -417,7 +417,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			return err
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, int64(len(data)), contentText)
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
@@ -528,7 +528,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 			return txErr
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType, int64(len(finalData)), contentText)
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
