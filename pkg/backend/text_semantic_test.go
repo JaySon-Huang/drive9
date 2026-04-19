@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"strings"
@@ -15,15 +16,18 @@ import (
 )
 
 type staticBackendTextSemanticGenerator struct {
-	text string
-	err  error
+	text  string
+	usage TextSemanticUsage
+	err   error
+	calls int
 }
 
-func (g staticBackendTextSemanticGenerator) GenerateFileSemanticText(_ context.Context, _ TextSemanticRequest) (string, TextSemanticUsage, error) {
+func (g *staticBackendTextSemanticGenerator) GenerateFileSemanticText(_ context.Context, _ TextSemanticRequest) (string, TextSemanticUsage, error) {
+	g.calls++
 	if g.err != nil {
 		return "", TextSemanticUsage{}, g.err
 	}
-	return g.text, TextSemanticUsage{}, nil
+	return g.text, g.usage, nil
 }
 
 type captureBackendTextSemanticGenerator struct {
@@ -155,11 +159,18 @@ func TestBasicTextSemanticGeneratorProducesStructuredText(t *testing.T) {
 }
 
 func TestProcessFileSemanticTaskWritesContentText(t *testing.T) {
+	generator := &staticBackendTextSemanticGenerator{
+		text:  "semantic_text_format: drive9-file-semantic/v1\npurpose:\n- test\nkey_topics:\n- topic\nimportant_identifiers:\n- ident\nstructure:\n- section\nsemantic_summary:\nsummary",
+		usage: TextSemanticUsage{PromptTokens: 80, CompletionTokens: 40},
+	}
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
+		LLMCostBudget: LLMCostBudgetOptions{
+			TextSemanticCostPerKTokenMillicents: 1000,
+		},
 		TextSemantic: TextSemanticOptions{
 			Enabled:   true,
-			Generator: staticBackendTextSemanticGenerator{text: "semantic_text_format: drive9-file-semantic/v1\npurpose:\n- test\nkey_topics:\n- topic\nimportant_identifiers:\n- ident\nstructure:\n- section\nsemantic_summary:\nsummary"},
+			Generator: generator,
 		},
 	})
 
@@ -169,6 +180,7 @@ func TestProcessFileSemanticTaskWritesContentText(t *testing.T) {
 	}
 	fileID, _, _, _ := mustFileForPath(t, b, "/docs/process.txt")
 	result, err := b.ProcessFileSemanticTask(context.Background(), TextSemanticTaskSpec{
+		TaskID:      "text-task-1",
 		FileID:      fileID,
 		Path:        "/docs/process.txt",
 		ContentType: "text/plain",
@@ -186,6 +198,16 @@ func TestProcessFileSemanticTaskWritesContentText(t *testing.T) {
 	}
 	if !strings.Contains(nf.File.ContentText, "drive9-file-semantic/v1") {
 		t.Fatalf("content_text=%q, want generated semantic text", nf.File.ContentText)
+	}
+	usage := mustLLMUsageRowForTask(t, b.Store().DB(), "text-task-1")
+	if usage.TaskType != "generate_file_semantic_text" {
+		t.Fatalf("task_type=%q, want generate_file_semantic_text", usage.TaskType)
+	}
+	if usage.RawUnits != 120 || usage.RawUnitType != "tokens" {
+		t.Fatalf("raw_units=%d raw_unit_type=%q, want 120/tokens", usage.RawUnits, usage.RawUnitType)
+	}
+	if usage.CostMillicents != 120 {
+		t.Fatalf("cost=%d, want 120", usage.CostMillicents)
 	}
 }
 
@@ -232,6 +254,123 @@ func TestProcessFileSemanticTaskUsesBoundedS3Read(t *testing.T) {
 	if string(generator.lastRequest.Data) != string(data[:64]) {
 		t.Fatalf("generator source mismatch, got %q want prefix %q", string(generator.lastRequest.Data), string(data[:64]))
 	}
+}
+
+func TestProcessFileSemanticTaskBudgetExhausted(t *testing.T) {
+	generator := &staticBackendTextSemanticGenerator{
+		text: "semantic_text_format: drive9-file-semantic/v1\nsemantic_summary:\nsummary",
+	}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		LLMCostBudget: LLMCostBudgetOptions{
+			MaxMonthlyMillicents:                1,
+			TextSemanticCostPerKTokenMillicents: 1000,
+		},
+		TextSemantic: TextSemanticOptions{
+			Enabled:   true,
+			Generator: generator,
+		},
+	})
+	if err := b.Store().InsertLLMUsage("img_extract_text", "spent", 2, 1, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	data := repeatedTextBytes(smallFileThreshold + 64)
+	if _, err := b.Write("/docs/budget.txt", data, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/docs/budget.txt")
+	result, err := b.ProcessFileSemanticTask(context.Background(), TextSemanticTaskSpec{
+		TaskID:      "text-task-budget",
+		FileID:      fileID,
+		Path:        "/docs/budget.txt",
+		ContentType: "text/plain",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != TextSemanticResultBudgetExhausted {
+		t.Fatalf("result=%q, want %q", result, TextSemanticResultBudgetExhausted)
+	}
+	if generator.calls != 0 {
+		t.Fatalf("generator calls=%d, want 0", generator.calls)
+	}
+	if count := countLLMUsageRowsForTask(t, b.Store().DB(), "text-task-budget"); count != 0 {
+		t.Fatalf("llm_usage rows=%d, want 0", count)
+	}
+}
+
+func TestProcessFileSemanticTaskFallsBackToFixedCost(t *testing.T) {
+	generator := &staticBackendTextSemanticGenerator{
+		text: "semantic_text_format: drive9-file-semantic/v1\nsemantic_summary:\nsummary",
+	}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		LLMCostBudget: LLMCostBudgetOptions{
+			FallbackTextSemanticCostMillicents: 77,
+		},
+		TextSemantic: TextSemanticOptions{
+			Enabled:   true,
+			Generator: generator,
+		},
+	})
+
+	data := repeatedTextBytes(smallFileThreshold + 64)
+	if _, err := b.Write("/docs/fallback.txt", data, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/docs/fallback.txt")
+	result, err := b.ProcessFileSemanticTask(context.Background(), TextSemanticTaskSpec{
+		TaskID:      "text-task-fallback",
+		FileID:      fileID,
+		Path:        "/docs/fallback.txt",
+		ContentType: "text/plain",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != TextSemanticResultWritten {
+		t.Fatalf("result=%q, want %q", result, TextSemanticResultWritten)
+	}
+	usage := mustLLMUsageRowForTask(t, b.Store().DB(), "text-task-fallback")
+	if usage.RawUnits != 0 || usage.RawUnitType != "fallback" {
+		t.Fatalf("raw_units=%d raw_unit_type=%q, want 0/fallback", usage.RawUnits, usage.RawUnitType)
+	}
+	if usage.CostMillicents != 77 {
+		t.Fatalf("cost=%d, want 77", usage.CostMillicents)
+	}
+}
+
+type llmUsageRow struct {
+	TaskType       string
+	TaskID         string
+	CostMillicents int64
+	RawUnits       int64
+	RawUnitType    string
+}
+
+func mustLLMUsageRowForTask(t *testing.T, db *sql.DB, taskID string) llmUsageRow {
+	t.Helper()
+	var row llmUsageRow
+	err := db.QueryRow(`SELECT task_type, task_id, cost_millicents, raw_units, raw_unit_type
+		FROM llm_usage WHERE task_id = ? ORDER BY created_at DESC LIMIT 1`, taskID).Scan(
+		&row.TaskType, &row.TaskID, &row.CostMillicents, &row.RawUnits, &row.RawUnitType,
+	)
+	if err != nil {
+		t.Fatalf("load llm_usage for %s: %v", taskID, err)
+	}
+	return row
+}
+
+func countLLMUsageRowsForTask(t *testing.T, db *sql.DB, taskID string) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM llm_usage WHERE task_id = ?`, taskID).Scan(&count); err != nil {
+		t.Fatalf("count llm_usage for %s: %v", taskID, err)
+	}
+	return count
 }
 
 func newTestStoreForTextSemantic(t *testing.T) *datastore.Store {

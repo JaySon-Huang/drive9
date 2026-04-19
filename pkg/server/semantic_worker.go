@@ -667,6 +667,9 @@ func (m *semanticWorkerManager) processFileSemanticTask(ctx context.Context, b *
 	if err != nil {
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
+	if result == backend.TextSemanticResultBudgetExhausted {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
+	}
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result)}
 }
 
@@ -1121,7 +1124,7 @@ func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtr
 	if task == nil {
 		return backend.ImageExtractTaskSpec{}
 	}
-	spec := backend.ImageExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	spec := backend.ImageExtractTaskSpec{TaskID: task.TaskID, FileID: task.ResourceID, Revision: task.ResourceVersion}
 	if len(task.PayloadJSON) == 0 {
 		return spec
 	}
@@ -1137,7 +1140,7 @@ func audioExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.AudioExtr
 	if task == nil {
 		return backend.AudioExtractTaskSpec{}
 	}
-	spec := backend.AudioExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	spec := backend.AudioExtractTaskSpec{TaskID: task.TaskID, FileID: task.ResourceID, Revision: task.ResourceVersion}
 	if len(task.PayloadJSON) == 0 {
 		return spec
 	}
@@ -1153,7 +1156,7 @@ func textSemanticTaskSpecFromSemanticTask(task *semantic.Task) backend.TextSeman
 	if task == nil {
 		return backend.TextSemanticTaskSpec{}
 	}
-	spec := backend.TextSemanticTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	spec := backend.TextSemanticTaskSpec{TaskID: task.TaskID, FileID: task.ResourceID, Revision: task.ResourceVersion}
 	if len(task.PayloadJSON) == 0 {
 		return spec
 	}

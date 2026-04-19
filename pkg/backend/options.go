@@ -68,6 +68,16 @@ type Options struct {
 	MaxMediaLLMFiles int64
 	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
 	LLMCostBudget LLMCostBudgetOptions
+	// MetaStore is the control-plane meta store. When set, LLM usage is
+	// recorded to (and budgets read from) the meta store instead of the
+	// per-tenant datastore.
+	MetaStore MetaLLMUsageStore
+	// TenantID identifies this tenant in the meta store's llm_usage table.
+	TenantID string
+	// LLMUsageDualRead enables dual-read mode during transition: budget checks
+	// sum costs from both meta store and tenant datastore. Set this to true
+	// during the first month of migration to avoid mid-month budget resets.
+	LLMUsageDualRead bool
 	// QuotaSource selects where quota enforcement reads authoritative state.
 	// "tenant" (default) uses per-tenant DB; "server" uses the central server DB.
 	QuotaSource QuotaSource
@@ -80,6 +90,9 @@ type LLMCostBudgetOptions struct {
 	MaxMonthlyMillicents int64
 	// VisionCostPerKTokenMillicents is the cost per 1K tokens for Vision API calls.
 	VisionCostPerKTokenMillicents int64
+	// TextSemanticCostPerKTokenMillicents is the cost per 1K tokens for file
+	// semantic text generation models.
+	TextSemanticCostPerKTokenMillicents int64
 	// AudioLLMCostPerKTokenMillicents is the cost per 1K tokens for token-based
 	// audio models (e.g. gpt-4o-transcribe).
 	AudioLLMCostPerKTokenMillicents int64
@@ -89,6 +102,10 @@ type LLMCostBudgetOptions struct {
 	// FallbackImageCostMillicents is used when the Vision API does not return
 	// token usage. Must be > 0 for cost tracking to work with such providers.
 	FallbackImageCostMillicents int64
+	// FallbackTextSemanticCostMillicents is used when the text semantic model
+	// does not return token usage. Must be > 0 for cost tracking to work with
+	// such providers.
+	FallbackTextSemanticCostMillicents int64
 	// FallbackAudioCostMillicents is used when the audio API returns neither
 	// duration nor token usage. Must be > 0 for cost tracking to work.
 	FallbackAudioCostMillicents int64
@@ -176,10 +193,16 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	cb := opts.LLMCostBudget
 	b.maxMonthlyLLMCostMillicents = cb.MaxMonthlyMillicents
 	b.visionCostPerKTokenMillicents = cb.VisionCostPerKTokenMillicents
+	b.textSemanticCostPerKTokenMillicents = cb.TextSemanticCostPerKTokenMillicents
 	b.audioLLMCostPerKTokenMillicents = cb.AudioLLMCostPerKTokenMillicents
 	b.whisperCostPerMinuteMillicents = cb.WhisperCostPerMinuteMillicents
 	b.fallbackImageCostMillicents = cb.FallbackImageCostMillicents
+	b.fallbackTextSemanticCostMillicents = cb.FallbackTextSemanticCostMillicents
 	b.fallbackAudioCostMillicents = cb.FallbackAudioCostMillicents
+
+	b.metaLLMStore = opts.MetaStore
+	b.tenantID = opts.TenantID
+	b.llmUsageDualRead = opts.LLMUsageDualRead
 
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client

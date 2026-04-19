@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 // TextSemanticRequest is the input to a pluggable file-level semantic text generator.
@@ -38,6 +39,8 @@ type TextSemanticGenerator interface {
 // TextSemanticTaskSpec carries the revision-scoped inputs needed to generate
 // file-level semantic text for one file version.
 type TextSemanticTaskSpec struct {
+	// TaskID is the durable semantic_tasks identity for this generation job.
+	TaskID      string
 	FileID      string
 	Path        string
 	ContentType string
@@ -59,6 +62,7 @@ const (
 	TextSemanticResultEmptyText            TextSemanticResult = "empty_text"
 	TextSemanticResultUpdateError          TextSemanticResult = "update_error"
 	TextSemanticResultWritten              TextSemanticResult = "written"
+	TextSemanticResultBudgetExhausted      TextSemanticResult = "budget_exhausted"
 )
 
 var identifierPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_./:-]*`)
@@ -131,6 +135,10 @@ func (b *Dat9Backend) ProcessFileSemanticTask(ctx context.Context, task TextSema
 	if !b.SupportsFileSemanticTextGenerate() {
 		return TextSemanticResultRuntimeNotConfigured, fmt.Errorf("text semantic runtime not configured")
 	}
+	if b.monthlyLLMCostExceeded() {
+		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		return TextSemanticResultBudgetExhausted, nil
+	}
 
 	f, err := b.store.GetFile(ctx, task.FileID)
 	if err != nil {
@@ -162,7 +170,7 @@ func (b *Dat9Backend) ProcessFileSemanticTask(ctx context.Context, task TextSema
 	}
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.textSemanticTimeout)
-	text, _, err := b.textSemanticGenerator.GenerateFileSemanticText(taskCtx, TextSemanticRequest{
+	text, usage, err := b.textSemanticGenerator.GenerateFileSemanticText(taskCtx, TextSemanticRequest{
 		FileID:      task.FileID,
 		Path:        task.Path,
 		ContentType: contentType,
@@ -172,6 +180,7 @@ func (b *Dat9Backend) ProcessFileSemanticTask(ctx context.Context, task TextSema
 	if err != nil {
 		return TextSemanticResultGenerateError, fmt.Errorf("generate file semantic text: %w", err)
 	}
+	b.recordTextSemanticUsage(task.TaskID, usage)
 	text = sanitizeGeneratedFileSemanticText(text, b.maxTextSemanticTextBytes)
 	if text == "" {
 		return TextSemanticResultEmptyText, nil

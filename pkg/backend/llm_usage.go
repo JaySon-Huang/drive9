@@ -32,17 +32,27 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 	if cost <= 0 {
 		return
 	}
-	// Write to tenant DB only when server quota is not active.
-	if !b.UseServerQuota() {
-		if err := b.store.InsertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
-			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
-				zap.String("task_type", "img_extract_text"),
-				zap.String("task_id", taskID),
-				zap.Error(err))
-			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
-		}
+	b.insertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens")
+}
+
+func (b *Dat9Backend) recordTextSemanticUsage(taskID string, usage TextSemanticUsage) {
+	var cost int64
+	var rawUnits int64
+	var rawUnitType string
+
+	totalTokens := int64(usage.TotalTokens())
+	if totalTokens > 0 {
+		cost = b.textSemanticTokenCostMillicents(totalTokens)
+		rawUnits = totalTokens
+		rawUnitType = "tokens"
+	} else {
+		cost = b.fallbackTextSemanticCostMillicents
+		rawUnitType = "fallback"
 	}
-	b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens")
+	if cost <= 0 {
+		return
+	}
+	b.insertLLMUsage("generate_file_semantic_text", taskID, cost, rawUnits, rawUnitType)
 }
 
 func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractUsage) {
@@ -66,17 +76,35 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 	if cost <= 0 {
 		return
 	}
-	// Write to tenant DB only when server quota is not active.
+	b.insertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType)
+}
+
+// insertLLMUsage writes a usage record to the dedicated meta LLM store (if
+// configured), otherwise preserves the existing server-quota and tenant-store
+// paths.
+func (b *Dat9Backend) insertLLMUsage(taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
+	ctx := backgroundWithTrace()
+	if b.metaLLMStore != nil && b.tenantID != "" {
+		if err := b.metaLLMStore.InsertLLMUsage(ctx, b.tenantID, taskType, taskID, costMillicents, rawUnits, rawUnitType); err != nil {
+			logger.Warn(ctx, "llm_usage_meta_insert_failed",
+				zap.String("task_type", taskType),
+				zap.String("task_id", taskID),
+				zap.String("tenant_id", b.tenantID),
+				zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "meta_usage_insert", "error", 0)
+		}
+		return
+	}
 	if !b.UseServerQuota() {
-		if err := b.store.InsertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
-			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
-				zap.String("task_type", "audio_extract_text"),
+		if err := b.store.InsertLLMUsage(taskType, taskID, costMillicents, rawUnits, rawUnitType); err != nil {
+			logger.Warn(ctx, "llm_usage_insert_failed",
+				zap.String("task_type", taskType),
 				zap.String("task_id", taskID),
 				zap.Error(err))
 			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
-	b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType)
+	b.syncCentralLLMCostRecord(ctx, taskType, taskID, costMillicents, rawUnits, rawUnitType)
 }
 
 func (b *Dat9Backend) imageTokenCostMillicents(totalTokens int64) int64 {
@@ -93,6 +121,13 @@ func (b *Dat9Backend) audioTokenCostMillicents(totalTokens int64) int64 {
 	return (totalTokens * b.audioLLMCostPerKTokenMillicents) / 1000
 }
 
+func (b *Dat9Backend) textSemanticTokenCostMillicents(totalTokens int64) int64 {
+	if b.textSemanticCostPerKTokenMillicents <= 0 || totalTokens <= 0 {
+		return 0
+	}
+	return (totalTokens * b.textSemanticCostPerKTokenMillicents) / 1000
+}
+
 func (b *Dat9Backend) audioDurationCostMillicents(durationSeconds float64) int64 {
 	if b.whisperCostPerMinuteMillicents <= 0 || durationSeconds <= 0 {
 		return 0
@@ -107,6 +142,23 @@ func (b *Dat9Backend) audioDurationCostMillicents(durationSeconds float64) int64
 func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	if b.maxMonthlyLLMCostMillicents <= 0 {
 		return false
+	}
+	if b.metaLLMStore != nil && b.tenantID != "" {
+		total, err := b.metaLLMStore.MonthlyLLMCostMillicents(backgroundWithTrace(), b.tenantID)
+		if err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_cost_budget_meta_check_fail_open", zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "meta_quota_check", "fail_open", 0)
+			return false
+		}
+		if b.llmUsageDualRead {
+			tenantTotal, err := b.store.MonthlyLLMCostMillicents()
+			if err != nil {
+				logger.Warn(backgroundWithTrace(), "llm_cost_budget_tenant_dual_read_failed", zap.Error(err))
+			} else {
+				total += tenantTotal
+			}
+		}
+		return total > b.maxMonthlyLLMCostMillicents
 	}
 	if b.UseServerQuota() && b.metaStore != nil && b.tenantID != "" {
 		total, err := b.metaStore.MonthlyLLMCostMillicents(backgroundWithTrace(), b.tenantID)

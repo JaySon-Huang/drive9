@@ -77,12 +77,18 @@ type Dat9Backend struct {
 	maxTextSemanticTextBytes   int
 
 	// Monthly LLM cost budget (P1).
-	maxMonthlyLLMCostMillicents     int64
-	visionCostPerKTokenMillicents   int64
-	audioLLMCostPerKTokenMillicents int64
-	whisperCostPerMinuteMillicents  int64
-	fallbackImageCostMillicents     int64
-	fallbackAudioCostMillicents     int64
+	maxMonthlyLLMCostMillicents         int64
+	visionCostPerKTokenMillicents       int64
+	textSemanticCostPerKTokenMillicents int64
+	audioLLMCostPerKTokenMillicents     int64
+	whisperCostPerMinuteMillicents      int64
+	fallbackImageCostMillicents         int64
+	fallbackTextSemanticCostMillicents  int64
+	fallbackAudioCostMillicents         int64
+
+	// Control-plane LLM usage (meta store migration).
+	metaLLMStore     MetaLLMUsageStore // nil = write to tenant datastore only
+	llmUsageDualRead bool
 }
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
