@@ -129,6 +129,11 @@ func TestBuildBackendOptionsFromEnvTextSemanticDisabled(t *testing.T) {
 		"DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES",
 		"DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS",
 		"DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+		"DRIVE9_TEXT_SEMANTIC_PROMPT",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TOKENS",
 	}
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
@@ -154,6 +159,11 @@ func TestBuildBackendOptionsFromEnvTextSemanticEnabled(t *testing.T) {
 		"DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES",
 		"DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS",
 		"DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+		"DRIVE9_TEXT_SEMANTIC_PROMPT",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TOKENS",
 	}
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
@@ -179,6 +189,64 @@ func TestBuildBackendOptionsFromEnvTextSemanticEnabled(t *testing.T) {
 	}
 	if opts.TextSemantic.MaxGenerateTextBytes != 2048 {
 		t.Fatalf("MaxGenerateTextBytes=%d, want 2048", opts.TextSemantic.MaxGenerateTextBytes)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvTextSemanticOpenAI(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+		"DRIVE9_TEXT_SEMANTIC_PROMPT",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TOKENS",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_ENABLED", "true")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_API_BASE", "https://example.com/v1")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_API_KEY", "secret")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_MODEL", "gpt-4.1-mini")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_PROMPT", "custom prompt")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", "333")
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if _, ok := opts.TextSemantic.Generator.(*backend.OpenAITextSemanticGenerator); !ok {
+		t.Fatalf("generator=%T, want *backend.OpenAITextSemanticGenerator", opts.TextSemantic.Generator)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvTextSemanticMissingRequiredConfig(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_ENABLED", "true")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_API_BASE", "https://example.com/v1")
+	setEnv(t, "DRIVE9_TEXT_SEMANTIC_API_KEY", "secret")
+	if _, err := buildBackendOptionsFromEnv(); err == nil {
+		t.Fatal("expected missing model config to fail")
 	}
 }
 

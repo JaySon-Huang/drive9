@@ -765,6 +765,35 @@ func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([
 	return nil, fmt.Errorf("unsupported storage type for direct read: %s", f.StorageType)
 }
 
+func (b *Dat9Backend) readFileDataUpToCtx(ctx context.Context, f *datastore.File, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return b.readFileDataCtx(ctx, f)
+	}
+	if f == nil {
+		return nil, fmt.Errorf("nil file")
+	}
+	if f.StorageType == datastore.StorageS3 {
+		if b.s3 == nil {
+			return nil, fmt.Errorf("s3 client not configured")
+		}
+		rc, err := b.s3.GetObject(ctx, f.StorageRef)
+		if err != nil {
+			logger.Error(ctx, "backend_read_get_object_failed", zap.String("storage_ref", f.StorageRef), zap.Error(err))
+			return nil, err
+		}
+		defer func() { _ = rc.Close() }()
+		return io.ReadAll(io.LimitReader(rc, maxBytes))
+	}
+	if f.StorageType == datastore.StorageDB9 {
+		data := f.ContentBlob
+		if int64(len(data)) > maxBytes {
+			data = data[:maxBytes]
+		}
+		return append([]byte(nil), data...), nil
+	}
+	return nil, fmt.Errorf("unsupported storage type for bounded direct read: %s", f.StorageType)
+}
+
 func (b *Dat9Backend) shouldStoreInDB(size int64) bool {
 	return b.smallInDB && size < smallFileThreshold
 }

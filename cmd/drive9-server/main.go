@@ -404,6 +404,11 @@ environment:
   DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: 262144)
   DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: 30)
   DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: 16384)
+  DRIVE9_TEXT_SEMANTIC_API_BASE OpenAI-compatible base URL (optional; enables remote generator when set with key+model)
+  DRIVE9_TEXT_SEMANTIC_API_KEY  API key for DRIVE9_TEXT_SEMANTIC_API_BASE (optional; required with API_BASE+MODEL)
+  DRIVE9_TEXT_SEMANTIC_MODEL    model name for text semantic generation (optional; required with API_BASE+API_KEY)
+  DRIVE9_TEXT_SEMANTIC_PROMPT   custom generation prompt (optional)
+  DRIVE9_TEXT_SEMANTIC_MAX_TOKENS max model output tokens (default: 512)
 
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
@@ -572,16 +577,48 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			zap.String("model", audioModel), zap.String("base_url", audioBaseURL))
 	}
 	if envBool("DRIVE9_TEXT_SEMANTIC_ENABLED", false) {
-		opts.TextSemantic = backend.TextSemanticOptions{
+		textSemantic := backend.TextSemanticOptions{
 			Enabled:              true,
 			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", 256<<10),
 			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", 30)) * time.Second,
 			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", 16<<10),
 		}
-		logger.Info(context.Background(), "text_semantic_mode_basic_fallback",
+		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_BASE"))
+		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_KEY"))
+		model := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_MODEL"))
+		prompt := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_PROMPT"))
+		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", 512)
+		configured := baseURL != "" || apiKey != "" || model != ""
+		if configured {
+			if baseURL == "" || apiKey == "" || model == "" {
+				return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_SEMANTIC_API_BASE, DRIVE9_TEXT_SEMANTIC_API_KEY and DRIVE9_TEXT_SEMANTIC_MODEL must be set together when DRIVE9_TEXT_SEMANTIC_ENABLED=true")
+			}
+			generator, err := backend.NewOpenAITextSemanticGenerator(backend.OpenAITextSemanticGeneratorConfig{
+				BaseURL:   baseURL,
+				APIKey:    apiKey,
+				Model:     model,
+				Prompt:    prompt,
+				MaxTokens: maxTokens,
+				Timeout:   textSemantic.TaskTimeout,
+			})
+			if err != nil {
+				return backend.Options{}, fmt.Errorf("init text semantic generator: %w", err)
+			}
+			textSemantic.Generator = generator
+			logger.Info(context.Background(), "text_semantic_mode_openai_compatible",
+				zap.String("model", model),
+				zap.String("base_url", baseURL),
+				zap.Int("max_tokens", maxTokens))
+		} else {
+			textSemantic.Generator = backend.NewBasicTextSemanticGenerator()
+			logger.Info(context.Background(), "text_semantic_mode_basic_fallback")
+		}
+		opts.TextSemantic = textSemantic
+		logger.Info(context.Background(), "text_semantic_runtime_configured",
 			zap.Int64("max_source_bytes", opts.TextSemantic.MaxSourceBytes),
 			zap.Duration("task_timeout", opts.TextSemantic.TaskTimeout),
-			zap.Int("max_text_bytes", opts.TextSemantic.MaxGenerateTextBytes))
+			zap.Int("max_text_bytes", opts.TextSemantic.MaxGenerateTextBytes),
+			zap.String("generator_type", fmt.Sprintf("%T", opts.TextSemantic.Generator)))
 	}
 	return opts, nil
 }

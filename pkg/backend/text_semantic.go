@@ -193,16 +193,7 @@ func (b *Dat9Backend) ProcessFileSemanticTask(ctx context.Context, task TextSema
 }
 
 func (b *Dat9Backend) loadTextSemanticSourceBytes(ctx context.Context, f *datastore.File) ([]byte, error) {
-	data, err := b.readFileDataCtx(ctx, f)
-	if err != nil {
-		return nil, err
-	}
-	if b.textSemanticMaxSourceBytes > 0 && int64(len(data)) > b.textSemanticMaxSourceBytes {
-		data = append([]byte(nil), data[:b.textSemanticMaxSourceBytes]...)
-	} else {
-		data = append([]byte(nil), data...)
-	}
-	return data, nil
+	return b.readFileDataUpToCtx(ctx, f, b.textSemanticMaxSourceBytes)
 }
 
 func sanitizeGeneratedFileSemanticText(text string, maxBytes int) string {
