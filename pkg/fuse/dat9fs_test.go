@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -181,6 +182,144 @@ func TestOpenTruncateWriteThroughShadow(t *testing.T) {
 	}
 	if n != 3 || string(buf) != "bye" {
 		t.Fatalf("shadow data = %q (%d), want bye (3)", buf[:n], n)
+	}
+}
+
+func TestCreateUnknownSizeFullPartDoesNotInitiateMultipart(t *testing.T) {
+	var initiateCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate" {
+			initiateCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR),
+	}, "stream.bin", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	data := bytes.Repeat([]byte("a"), int(DefaultPartSize))
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	if got := initiateCalls.Load(); got != 0 {
+		t.Fatalf("multipart initiate calls = %d, want 0", got)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.Dirty.IsShadowEvictedPart(0) {
+		t.Fatal("full part should be shadow-evicted for unknown-size create")
+	}
+	if fh.Streamer.HasStreamedParts() {
+		t.Fatal("streamer should not mark streamed parts before flush")
+	}
+}
+
+func TestOpenTruncateUnknownSizeFullPartDoesNotInitiateMultipart(t *testing.T) {
+	var initiateCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			initiateCalls.Add(1)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		case r.Method == http.MethodGet:
+			_, _ = io.WriteString(w, "old")
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	data := bytes.Repeat([]byte("b"), int(DefaultPartSize))
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	if got := initiateCalls.Load(); got != 0 {
+		t.Fatalf("multipart initiate calls = %d, want 0", got)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.Dirty.IsShadowEvictedPart(0) {
+		t.Fatal("full part should be shadow-evicted for unknown-size truncate")
+	}
+	if fh.Streamer.HasStreamedParts() {
+		t.Fatal("streamer should not mark streamed parts before flush")
 	}
 }
 
