@@ -2,11 +2,14 @@ package logger
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
 
@@ -82,5 +85,32 @@ func TestInfoBenchTimingHonorsEnabledFlag(t *testing.T) {
 	}
 	if entries[0].Message != "timing_enabled" {
 		t.Fatalf("message = %q, want timing_enabled", entries[0].Message)
+	}
+}
+
+func TestHumanDateTimeJSONEncoderAddsDateTimeField(t *testing.T) {
+	encoderCfg := zap.NewProductionEncoderConfig()
+	encoder := newHumanDateTimeJSONEncoder(encoderCfg)
+	entry := zapcore.Entry{
+		Level:   zap.InfoLevel,
+		Time:    time.Date(2018, 12, 15, 14, 20, 11, 15*1e6, time.FixedZone("+08", 8*60*60)),
+		Message: "hello",
+	}
+
+	buf, err := encoder.EncodeEntry(entry, nil)
+	if err != nil {
+		t.Fatalf("EncodeEntry: %v", err)
+	}
+	defer buf.Free()
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if _, ok := got["ts"]; !ok {
+		t.Fatalf("missing ts field: %s", buf.String())
+	}
+	if got["date_time"] != "2018/12/15 14:20:11.015 +08:00" {
+		t.Fatalf("date_time=%v, want %q", got["date_time"], "2018/12/15 14:20:11.015 +08:00")
 	}
 }
