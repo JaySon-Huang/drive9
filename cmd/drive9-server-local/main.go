@@ -361,15 +361,19 @@ environment:
 
   File semantic text generation (durable text-like semantic closure):
   DRIVE9_TEXT_SEMANTIC_ENABLED true|false (default: false)
-  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: 262144)
-  DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: 30)
-  DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: 16384)
+  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: %d)
+  DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: %d)
+  DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: %d)
   DRIVE9_TEXT_SEMANTIC_API_BASE OpenAI-compatible base URL (optional; enables remote generator when set with key+model)
   DRIVE9_TEXT_SEMANTIC_API_KEY  API key for DRIVE9_TEXT_SEMANTIC_API_BASE (optional; required with API_BASE+MODEL)
   DRIVE9_TEXT_SEMANTIC_MODEL    model name for text semantic generation (optional; required with API_BASE+API_KEY)
   DRIVE9_TEXT_SEMANTIC_PROMPT   custom generation prompt (optional)
-  DRIVE9_TEXT_SEMANTIC_MAX_TOKENS max model output tokens (default: 512)
-`)
+  DRIVE9_TEXT_SEMANTIC_MAX_TOKENS max model output tokens (default: %d)
+	`,
+		backend.DefaultTextSemanticMaxSourceBytes,
+		int(backend.DefaultTextSemanticTimeout/time.Second),
+		backend.DefaultTextSemanticMaxGenerateTextBytes,
+		backend.DefaultTextSemanticMaxTokens)
 	os.Exit(2)
 }
 
@@ -619,15 +623,15 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	if envBool("DRIVE9_TEXT_SEMANTIC_ENABLED", false) {
 		textSemantic := backend.TextSemanticOptions{
 			Enabled:              true,
-			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", 256<<10),
-			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", 30)) * time.Second,
-			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", 16<<10),
+			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", backend.DefaultTextSemanticMaxSourceBytes),
+			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", int(backend.DefaultTextSemanticTimeout/time.Second))) * time.Second,
+			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", backend.DefaultTextSemanticMaxGenerateTextBytes),
 		}
 		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_BASE"))
 		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_KEY"))
 		model := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_MODEL"))
 		prompt := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_PROMPT"))
-		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", 512)
+		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", backend.DefaultTextSemanticMaxTokens)
 		configured := baseURL != "" || apiKey != "" || model != ""
 		if configured {
 			if baseURL == "" || apiKey == "" || model == "" {

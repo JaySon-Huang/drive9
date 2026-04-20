@@ -19,13 +19,23 @@ const (
 	defaultMaxExtractedTextBytes      = 8 << 10         // 8 KiB
 	defaultAudioExtractMaxSize        = int64(32 << 20) // 32 MiB
 	defaultAudioExtractTimeout        = 2 * time.Minute
-	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
-	defaultTextSemanticMaxSourceBytes = int64(256 << 10) // 256 KiB
-	defaultTextSemanticTimeout        = 30 * time.Second
-	defaultMaxTextSemanticTextBytes   = 16 << 10              // 16 KiB
-	defaultMaxUploadBytes             = int64(10 * (1 << 30)) // 10 GiB
-	defaultMaxTenantStorageBytes      = int64(50 * (1 << 30)) // 50 GiB
-	defaultMaxMediaLLMFiles           = int64(500)            // 500 media files per tenant
+	defaultMaxAudioExtractedTextBytes = 8 << 10 // 8 KiB
+	// DefaultTextSemanticMaxSourceBytes is the default upper bound on source
+	// bytes loaded into one durable file semantic generation task.
+	DefaultTextSemanticMaxSourceBytes = int64(128 << 10) // 128 KiB
+	// DefaultTextSemanticTimeout is the default per-task timeout for durable
+	// file semantic text generation.
+	DefaultTextSemanticTimeout = 180 * time.Second
+	// DefaultTextSemanticMaxGenerateTextBytes is the default upper bound on
+	// generated retrieval text stored in files.content_text for one durable file
+	// semantic generation task.
+	DefaultTextSemanticMaxGenerateTextBytes = 16 << 10 // 16 KiB
+	// DefaultTextSemanticMaxTokens is the default model output token cap for the
+	// OpenAI-compatible text semantic generator.
+	DefaultTextSemanticMaxTokens = 51200
+	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
+	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
+	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
 )
 
 // QuotaSource controls where quota checks read authoritative state from.
@@ -282,13 +292,13 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	t := opts.TextSemantic
 	if TextSemanticWillWireRuntime(t) {
 		if t.MaxSourceBytes <= 0 {
-			t.MaxSourceBytes = defaultTextSemanticMaxSourceBytes
+			t.MaxSourceBytes = DefaultTextSemanticMaxSourceBytes
 		}
 		if t.TaskTimeout <= 0 {
-			t.TaskTimeout = defaultTextSemanticTimeout
+			t.TaskTimeout = DefaultTextSemanticTimeout
 		}
 		if t.MaxGenerateTextBytes <= 0 {
-			t.MaxGenerateTextBytes = defaultMaxTextSemanticTextBytes
+			t.MaxGenerateTextBytes = DefaultTextSemanticMaxGenerateTextBytes
 		}
 		if t.Generator == nil {
 			t.Generator = NewBasicTextSemanticGenerator()

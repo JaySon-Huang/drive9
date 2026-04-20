@@ -15,8 +15,7 @@ import (
 )
 
 const (
-	defaultTextSemanticPrompt    = "You generate retrieval-oriented semantic text for one direct-text file. Return plain text only. Use exactly this structure:\nsemantic_text_format: drive9-file-semantic/v1\npurpose:\n- ...\nkey_topics:\n- ...\nimportant_identifiers:\n- ...\nstructure:\n- ...\nsemantic_summary:\n...\nKeep the output concise, factual, and useful for search. Do not wrap the answer in markdown fences."
-	defaultTextSemanticMaxTokens = 51200
+	defaultTextSemanticPrompt = "You generate retrieval-oriented semantic text for one direct-text file. Return plain text only. Use exactly this structure:\nsemantic_text_format: drive9-file-semantic/v1\npurpose:\n- ...\nkey_topics:\n- ...\nimportant_identifiers:\n- ...\nstructure:\n- ...\nsemantic_summary:\n...\nKeep the output concise, factual, and useful for search. Do not wrap the answer in markdown fences."
 )
 
 // OpenAITextSemanticGeneratorConfig configures an OpenAI-compatible text
@@ -66,14 +65,14 @@ func NewOpenAITextSemanticGenerator(cfg OpenAITextSemanticGeneratorConfig) (*Ope
 		cfg.Prompt = defaultTextSemanticPrompt
 	}
 	if cfg.MaxTokens <= 0 {
-		cfg.MaxTokens = defaultTextSemanticMaxTokens
+		cfg.MaxTokens = DefaultTextSemanticMaxTokens
 	}
 
 	client := cfg.Client
 	if client == nil {
 		timeout := cfg.Timeout
 		if timeout <= 0 {
-			timeout = defaultTextSemanticTimeout
+			timeout = DefaultTextSemanticTimeout
 		}
 		client = &http.Client{Timeout: timeout}
 	}

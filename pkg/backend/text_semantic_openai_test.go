@@ -49,6 +49,22 @@ func TestNewOpenAITextSemanticGeneratorValidation(t *testing.T) {
 	}
 }
 
+func TestNewOpenAITextSemanticGeneratorDefaults(t *testing.T) {
+	t.Parallel()
+
+	generator, err := NewOpenAITextSemanticGenerator(OpenAITextSemanticGeneratorConfig{
+		BaseURL: "https://example.com",
+		APIKey:  "secret",
+		Model:   "gpt-4.1-mini",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.maxTokens != DefaultTextSemanticMaxTokens {
+		t.Fatalf("maxTokens=%d, want %d", generator.maxTokens, DefaultTextSemanticMaxTokens)
+	}
+}
+
 func TestOpenAITextSemanticGeneratorGenerateFileSemanticText(t *testing.T) {
 	t.Parallel()
 

@@ -387,7 +387,7 @@ environment:
   DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
-  Audio extraction (async audio -> text for search; MVP durable path is TiDB auto-embedding only):
+  Audio extraction (async audio -> text for search; TiDB auto-embedding only):
   Durable audio_extract_text tasks enqueue only for tenants with database auto-embedding
   (tidb_zero / tidb_cloud_starter). For db9-only or other app-managed tenants these vars do
   not enable that semantic_tasks pipeline. When enabled, explicit provider wiring is required:
@@ -401,19 +401,24 @@ environment:
   DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription
   File semantic text generation (durable text-like semantic closure; TiDB auto-embedding only):
   DRIVE9_TEXT_SEMANTIC_ENABLED true|false (default: false)
-  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: 16384)
-  DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: 30)
-  DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: 16384)
+  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: %d)
+  DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: %d)
+  DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: %d)
   DRIVE9_TEXT_SEMANTIC_API_BASE OpenAI-compatible base URL (optional; enables remote generator when set with key+model)
   DRIVE9_TEXT_SEMANTIC_API_KEY  API key for DRIVE9_TEXT_SEMANTIC_API_BASE (optional; required with API_BASE+MODEL)
   DRIVE9_TEXT_SEMANTIC_MODEL    model name for text semantic generation (optional; required with API_BASE+API_KEY)
   DRIVE9_TEXT_SEMANTIC_PROMPT   custom generation prompt (optional)
-  DRIVE9_TEXT_SEMANTIC_MAX_TOKENS max model output tokens (default: 512)
+  DRIVE9_TEXT_SEMANTIC_MAX_TOKENS max model output tokens (default: %d)
 
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes)
+`,
+		server.DefaultMaxUploadBytes,
+		backend.DefaultTextSemanticMaxSourceBytes,
+		int(backend.DefaultTextSemanticTimeout/time.Second),
+		backend.DefaultTextSemanticMaxGenerateTextBytes,
+		backend.DefaultTextSemanticMaxTokens)
 	os.Exit(exitCode)
 }
 
@@ -579,15 +584,15 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	if envBool("DRIVE9_TEXT_SEMANTIC_ENABLED", false) {
 		textSemantic := backend.TextSemanticOptions{
 			Enabled:              true,
-			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", 16<<10),
-			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", 60)) * time.Second,
-			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", 16<<10),
+			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", backend.DefaultTextSemanticMaxSourceBytes),
+			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", int(backend.DefaultTextSemanticTimeout/time.Second))) * time.Second,
+			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", backend.DefaultTextSemanticMaxGenerateTextBytes),
 		}
 		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_BASE"))
 		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_KEY"))
 		model := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_MODEL"))
 		prompt := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_PROMPT"))
-		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", 51200)
+		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", backend.DefaultTextSemanticMaxTokens)
 		configured := baseURL != "" || apiKey != "" || model != ""
 		if configured {
 			if baseURL == "" || apiKey == "" || model == "" {
