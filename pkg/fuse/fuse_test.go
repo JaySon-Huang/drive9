@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -1087,6 +1088,64 @@ func TestWriteBuffer_EvictPart(t *testing.T) {
 	// Part should be dirty (needs re-upload)
 	if !wb.dirtyParts[0] {
 		t.Fatal("back-written evicted part should be dirty")
+	}
+}
+
+func TestWriteBuffer_EvictShadowPartReloadsFromShadow(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	shadowPart := bytes.Repeat([]byte("s"), int(DefaultPartSize))
+	wb.LoadShadowPart = func(partIdx int) ([]byte, error) {
+		if partIdx != 0 {
+			t.Fatalf("LoadShadowPart partIdx = %d, want 0", partIdx)
+		}
+		return shadowPart, nil
+	}
+
+	_, _ = wb.Write(0, shadowPart)
+	if !wb.IsPartLoaded(0) {
+		t.Fatal("part 0 should be loaded before eviction")
+	}
+
+	memBefore := wb.curMemory
+	wb.EvictShadowPart(0)
+
+	if wb.IsPartLoaded(0) {
+		t.Fatal("part 0 should be removed from memory after shadow eviction")
+	}
+	if !wb.IsShadowEvictedPart(0) {
+		t.Fatal("part 0 should be marked as shadow-evicted")
+	}
+	if wb.curMemory >= memBefore {
+		t.Fatalf("memory should decrease after shadow eviction: before=%d after=%d", memBefore, wb.curMemory)
+	}
+
+	part := wb.PartData(1)
+	if len(part) != int(DefaultPartSize) {
+		t.Fatalf("reloaded part len = %d, want %d", len(part), DefaultPartSize)
+	}
+	if !bytes.Equal(part, shadowPart) {
+		t.Fatal("reloaded part should match shadow bytes")
+	}
+	if !wb.IsPartLoaded(0) {
+		t.Fatal("part 0 should be reloaded into memory")
+	}
+	if wb.IsShadowEvictedPart(0) {
+		t.Fatal("part 0 should no longer be marked shadow-evicted after reload")
+	}
+}
+
+func TestWriteBuffer_HasStreamedPartsIgnoresShadowEviction(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.EvictShadowPart(0)
+
+	su := NewStreamUploader(nil, "/test", -1)
+	if su.HasStreamedParts() {
+		t.Fatal("stream uploader should have no streamed parts initially")
+	}
+
+	if wb.uploadedParts != nil && len(wb.uploadedParts) != 0 {
+		t.Fatal("shadow eviction must not populate uploadedParts")
 	}
 }
 

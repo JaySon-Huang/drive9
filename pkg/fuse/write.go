@@ -16,6 +16,10 @@ const (
 // partNum is 1-based. Returns the part data.
 type LoadPartFunc func(partNum int) ([]byte, error)
 
+// LoadShadowPartFunc reloads a previously evicted full part from the local
+// shadow file. partIdx is 0-based.
+type LoadShadowPartFunc func(partIdx int) ([]byte, error)
+
 // WriteBuffer accumulates write data for a single file.
 // It uses a sparse part map: only parts that have been written to or
 // explicitly loaded are held in memory. This enables lazy preloading
@@ -52,6 +56,10 @@ type WriteBuffer struct {
 
 	// Streaming upload state
 	uploadedParts map[int]bool // 0-based part indices uploaded by StreamUploader
+	// shadowEvictedParts tracks full parts evicted from memory whose exact bytes
+	// remain recoverable from the local shadow file.
+	shadowEvictedParts map[int]bool
+	LoadShadowPart     LoadShadowPartFunc
 	// OnPartFull is called when a sequential write fills a part completely.
 	// partIdx is 0-based, data is the full part data (partSize bytes).
 	// The callback should copy data if it needs to outlive the call.
@@ -179,6 +187,23 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 // nil entry that will be grown as needed by Write.
 func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	if _, ok := wb.parts[partIdx]; ok {
+		return nil
+	}
+
+	// Check if this part was evicted after streaming upload.
+	if wb.shadowEvictedParts != nil && wb.shadowEvictedParts[partIdx] {
+		if wb.LoadShadowPart == nil {
+			return syscall.EIO
+		}
+		data, err := wb.LoadShadowPart(partIdx)
+		if err != nil {
+			return err
+		}
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		wb.parts[partIdx] = cp
+		wb.curMemory += int64(len(cp))
+		delete(wb.shadowEvictedParts, partIdx)
 		return nil
 	}
 
@@ -316,6 +341,9 @@ func (wb *WriteBuffer) Bytes() []byte {
 	buf := make([]byte, wb.totalSize)
 	numParts := int((wb.totalSize + wb.partSize - 1) / wb.partSize)
 	for i := 0; i < numParts; i++ {
+		if err := wb.ensurePart(i); err != nil {
+			continue
+		}
 		part, ok := wb.parts[i]
 		if !ok || part == nil {
 			continue
@@ -354,6 +382,9 @@ func (wb *WriteBuffer) PartData(partNum int) []byte {
 	partIdx := partNum - 1
 	start := int64(partIdx) * wb.partSize
 	if start >= wb.totalSize {
+		return nil
+	}
+	if err := wb.ensurePart(partIdx); err != nil {
 		return nil
 	}
 
@@ -404,6 +435,9 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 	for copied < total {
 		partIdx := int(pos / wb.partSize)
 		partOff := pos % wb.partSize
+		if err := wb.ensurePart(partIdx); err != nil {
+			break
+		}
 
 		// How much from this part?
 		canRead := wb.partSize - partOff
@@ -478,6 +512,8 @@ func (wb *WriteBuffer) CanMaterializeFull() bool {
 func (wb *WriteBuffer) Reset() {
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
+	wb.uploadedParts = make(map[int]bool)
+	wb.shadowEvictedParts = make(map[int]bool)
 	wb.totalSize = 0
 	wb.curMemory = 0
 }
@@ -525,6 +561,30 @@ func (wb *WriteBuffer) EvictPart(partIdx int) {
 		wb.curMemory -= int64(len(part))
 		delete(wb.parts, partIdx)
 	}
+}
+
+// EvictShadowPart releases the in-memory bytes for a full part whose source of
+// truth is the local shadow file. The part remains readable and flushable via
+// LoadShadowPart, but it must not be treated as already uploaded remotely.
+func (wb *WriteBuffer) EvictShadowPart(partIdx int) {
+	if wb.shadowEvictedParts == nil {
+		wb.shadowEvictedParts = make(map[int]bool)
+	}
+	wb.shadowEvictedParts[partIdx] = true
+
+	if part, ok := wb.parts[partIdx]; ok {
+		wb.curMemory -= int64(len(part))
+		delete(wb.parts, partIdx)
+	}
+}
+
+// IsShadowEvictedPart reports whether the part has been evicted from memory
+// but is still recoverable from the local shadow file.
+func (wb *WriteBuffer) IsShadowEvictedPart(partIdx int) bool {
+	if wb.shadowEvictedParts == nil {
+		return false
+	}
+	return wb.shadowEvictedParts[partIdx]
 }
 
 // StreamedPartIndices returns the set of 0-based part indices that were
