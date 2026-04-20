@@ -133,3 +133,43 @@ func TestOpenAITextSemanticGeneratorGenerateFileSemanticText(t *testing.T) {
 		t.Fatalf("usage=%+v, want prompt=123 completion=45", usage)
 	}
 }
+
+func TestOpenAITextSemanticGeneratorGenerateFileSemanticTextEmptyContentDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"content":"","reasoning":"thinking about TiDB active-active design"},"finish_reason":"length"}]
+		}`))
+	}))
+	defer srv.Close()
+
+	generator, err := NewOpenAITextSemanticGenerator(OpenAITextSemanticGeneratorConfig{
+		BaseURL: srv.URL,
+		APIKey:  "secret",
+		Model:   "gpt-4.1-mini",
+		Client:  srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = generator.GenerateFileSemanticText(context.Background(), TextSemanticRequest{
+		Path:        "/docs/example.txt",
+		ContentType: "text/plain",
+		Data:        []byte("alpha\nbeta\n"),
+	})
+	if err == nil {
+		t.Fatal("expected error for empty content response")
+	}
+	for _, want := range []string{
+		`finish_reason="length"`,
+		`reasoning_present=true`,
+		`thinking about TiDB active-active design`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
+	}
+}

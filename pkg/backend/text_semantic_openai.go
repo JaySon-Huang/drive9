@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 const (
 	defaultTextSemanticPrompt    = "You generate retrieval-oriented semantic text for one direct-text file. Return plain text only. Use exactly this structure:\nsemantic_text_format: drive9-file-semantic/v1\npurpose:\n- ...\nkey_topics:\n- ...\nimportant_identifiers:\n- ...\nstructure:\n- ...\nsemantic_summary:\n...\nKeep the output concise, factual, and useful for search. Do not wrap the answer in markdown fences."
-	defaultTextSemanticMaxTokens = 512
+	defaultTextSemanticMaxTokens = 51200
 )
 
 // OpenAITextSemanticGeneratorConfig configures an OpenAI-compatible text
@@ -130,8 +133,10 @@ func (g *OpenAITextSemanticGenerator) GenerateFileSemanticText(ctx context.Conte
 		} `json:"error"`
 		Choices []struct {
 			Message struct {
-				Content any `json:"content"`
+				Content   any    `json:"content"`
+				Reasoning string `json:"reasoning"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -153,8 +158,29 @@ func (g *OpenAITextSemanticGenerator) GenerateFileSemanticText(ctx context.Conte
 	if len(parsed.Choices) == 0 {
 		return "", TextSemanticUsage{}, fmt.Errorf("text semantic api returned no choices")
 	}
-	text := extractOpenAIContentText(parsed.Choices[0].Message.Content)
+	choice := parsed.Choices[0]
+	text := extractOpenAIContentText(choice.Message.Content)
 	if strings.TrimSpace(text) == "" {
+		// Some OpenAI-compatible runtimes return no assistant content even though a
+		// choice exists, for example when they emit chain-of-thought-like text only
+		// in a non-standard reasoning field, or when generation stops at
+		// finish_reason=length before producing final answer text in content.
+		reasoning := strings.TrimSpace(choice.Message.Reasoning)
+		reasoningPreview := truncateString(reasoning, 256)
+		logger.Warn(ctx, "text_semantic_api_empty_content",
+			zap.String("path", req.Path),
+			zap.String("model", g.model),
+			zap.String("finish_reason", choice.FinishReason),
+			zap.Bool("reasoning_present", reasoning != ""),
+			zap.String("reasoning_preview", reasoningPreview))
+		if reasoning != "" || choice.FinishReason != "" {
+			return "", TextSemanticUsage{}, fmt.Errorf(
+				"text semantic api returned empty text (finish_reason=%q reasoning_present=%t reasoning_preview=%q)",
+				choice.FinishReason,
+				reasoning != "",
+				reasoningPreview,
+			)
+		}
 		return "", TextSemanticUsage{}, fmt.Errorf("text semantic api returned empty text")
 	}
 

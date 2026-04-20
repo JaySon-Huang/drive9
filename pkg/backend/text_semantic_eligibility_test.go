@@ -95,3 +95,26 @@ func TestShouldEnqueueFileSemanticTask(t *testing.T) {
 		})
 	}
 }
+
+func TestDetectContentTypeMarkdown(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "/docs/design.md", want: "text/markdown"},
+		{path: "/docs/design.markdown", want: "text/markdown"},
+		{path: "/docs/DESIGN.MD", want: "text/markdown"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+			if got := detectContentType(tc.path, nil); got != tc.want {
+				t.Fatalf("detectContentType(%q, nil)=%q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}

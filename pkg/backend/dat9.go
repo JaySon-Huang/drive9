@@ -884,6 +884,10 @@ func sha256sum(data []byte) string {
 func detectContentType(path string, data []byte) string {
 	ext := pathutil.Ext(path)
 	if ext != "" {
+		switch strings.ToLower(ext) {
+		case ".md", ".markdown":
+			return "text/markdown"
+		}
 		if ct := mime.TypeByExtension(ext); ct != "" {
 			return ct
 		}

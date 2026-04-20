@@ -401,7 +401,7 @@ environment:
   DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription
   File semantic text generation (durable text-like semantic closure; TiDB auto-embedding only):
   DRIVE9_TEXT_SEMANTIC_ENABLED true|false (default: false)
-  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: 262144)
+  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: 16384)
   DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: 30)
   DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: 16384)
   DRIVE9_TEXT_SEMANTIC_API_BASE OpenAI-compatible base URL (optional; enables remote generator when set with key+model)
@@ -579,15 +579,15 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	if envBool("DRIVE9_TEXT_SEMANTIC_ENABLED", false) {
 		textSemantic := backend.TextSemanticOptions{
 			Enabled:              true,
-			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", 256<<10),
-			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", 30)) * time.Second,
+			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", 16<<10),
+			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", 60)) * time.Second,
 			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", 16<<10),
 		}
 		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_BASE"))
 		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_KEY"))
 		model := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_MODEL"))
 		prompt := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_PROMPT"))
-		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", 512)
+		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", 51200)
 		configured := baseURL != "" || apiKey != "" || model != ""
 		if configured {
 			if baseURL == "" || apiKey == "" || model == "" {
