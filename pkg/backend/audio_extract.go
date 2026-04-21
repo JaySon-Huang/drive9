@@ -30,6 +30,8 @@ type AudioTextExtractor interface {
 // AudioExtractTaskSpec carries the revision-scoped inputs needed to extract
 // audio transcript text for one file version.
 type AudioExtractTaskSpec struct {
+	// TaskID is the durable semantic_tasks identity for this extraction job.
+	TaskID      string
 	FileID      string
 	Path        string
 	ContentType string
@@ -283,7 +285,11 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if err != nil {
 		return AudioExtractResultExtractError, fmt.Errorf("extract audio text: %w", err)
 	}
-	b.recordAudioExtractUsage(task.FileID, audioUsage)
+	usageTaskID := task.TaskID
+	if usageTaskID == "" {
+		usageTaskID = task.FileID
+	}
+	b.recordAudioExtractUsage(usageTaskID, audioUsage)
 	text = sanitizeExtractedText(text, b.maxAudioExtractTextBytes)
 	if text == "" {
 		return AudioExtractResultEmptyText, nil

@@ -87,6 +87,23 @@
 # DRIVE9_AUDIO_EXTRACT_MODEL
 # DRIVE9_AUDIO_EXTRACT_PROMPT
 
+# Optional: durable file-level text semantic generation.
+# Wires generate_file_semantic_text tasks for large direct-text files on the
+# TiDB auto-embedding path.
+# Leave unset to keep text semantic disabled (default).
+# : "${DRIVE9_LOCAL_EMBEDDING_MODE:=auto}"
+# : "${DRIVE9_TEXT_SEMANTIC_ENABLED:=true}"
+# Optional tuning (omit to use backend defaults):
+# DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES
+# DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS
+# DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES
+# OpenAI-compatible mode only:
+# DRIVE9_TEXT_SEMANTIC_API_BASE
+# DRIVE9_TEXT_SEMANTIC_API_KEY
+# DRIVE9_TEXT_SEMANTIC_MODEL
+# DRIVE9_TEXT_SEMANTIC_PROMPT
+# DRIVE9_TEXT_SEMANTIC_MAX_TOKENS
+
 export DRIVE9_PUBLIC_URL
 export DRIVE9_LOCAL_DSN
 export DRIVE9_LOCAL_API_KEY
@@ -109,14 +126,30 @@ else
   echo "S3 mode: local (${DRIVE9_S3_DIR})"
 fi
 echo "Run: make run-server-local"
+if [[ "${DRIVE9_AUDIO_EXTRACT_ENABLED:-}" == "true" ]]; then
+  echo ""
+  echo "Audio extract e2e (optional): enable stub runtime, then run the verifier, e.g."
+  echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=stub"
+  echo "  make run-server-local"
+  echo "  python3 scripts/verify_local_audio_extract.py [--mode basic]"
+  echo ""
+  echo "Audio extract provider smoke (optional):"
+  echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=openai"
+  echo "  export DRIVE9_AUDIO_EXTRACT_API_BASE=... DRIVE9_AUDIO_EXTRACT_API_KEY=... DRIVE9_AUDIO_EXTRACT_MODEL=..."
+  echo "  make run-server-local"
+  echo "  python3 scripts/verify_local_audio_extract.py --mode openai --audio-file /path/to/sample.wav"
+fi
+if [[ "${DRIVE9_TEXT_SEMANTIC_ENABLED:-}" == "true" ]]; then
+  echo ""
+  echo "Text semantic e2e (optional): enable TiDB auto-embedding plus text semantic, then run the verifier, e.g."
+  echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_TEXT_SEMANTIC_ENABLED=true"
+  echo "  make run-server-local"
+  echo "  python3 scripts/verify_local_text_semantic.py [--mode basic]"
+  echo ""
+  echo "Text semantic provider smoke (optional):"
+  echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_TEXT_SEMANTIC_ENABLED=true"
+  echo "  export DRIVE9_TEXT_SEMANTIC_API_BASE=... DRIVE9_TEXT_SEMANTIC_API_KEY=... DRIVE9_TEXT_SEMANTIC_MODEL=..."
+  echo "  make run-server-local"
+  echo "  python3 scripts/verify_local_text_semantic.py --mode openai --text-file /path/to/proposal.md"
+fi
 echo ""
-echo "Audio extract e2e (optional): enable stub runtime, then run the verifier, e.g."
-echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=stub"
-echo "  make run-server-local"
-echo "  python3 scripts/verify_local_audio_extract.py"
-echo ""
-echo "Audio extract provider smoke (optional):"
-echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=openai"
-echo "  export DRIVE9_AUDIO_EXTRACT_API_BASE=... DRIVE9_AUDIO_EXTRACT_API_KEY=... DRIVE9_AUDIO_EXTRACT_MODEL=..."
-echo "  make run-server-local"
-echo "  python3 scripts/verify_local_audio_extract.py --mode openai --audio-file /path/to/sample.wav"

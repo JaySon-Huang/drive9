@@ -12,14 +12,27 @@ import (
 )
 
 const (
-	defaultImageExtractQueueSize = 128
-	defaultImageExtractWorkers   = 1
-	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
-	defaultImageExtractTimeout   = 20 * time.Second
-	defaultMaxExtractedTextBytes = 8 << 10               // 8 KiB
-	defaultAudioExtractMaxSize   = int64(32 << 20)       // 32 MiB
-	defaultAudioExtractTimeout   = 2 * time.Minute
-	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
+	defaultImageExtractQueueSize      = 128
+	defaultImageExtractWorkers        = 1
+	defaultImageExtractMaxSize        = int64(8 << 20) // 8 MiB
+	defaultImageExtractTimeout        = 20 * time.Second
+	defaultMaxExtractedTextBytes      = 8 << 10         // 8 KiB
+	defaultAudioExtractMaxSize        = int64(32 << 20) // 32 MiB
+	defaultAudioExtractTimeout        = 2 * time.Minute
+	defaultMaxAudioExtractedTextBytes = 8 << 10 // 8 KiB
+	// DefaultTextSemanticMaxSourceBytes is the default upper bound on source
+	// bytes loaded into one durable file semantic generation task.
+	DefaultTextSemanticMaxSourceBytes = int64(128 << 10) // 128 KiB
+	// DefaultTextSemanticTimeout is the default per-task timeout for durable
+	// file semantic text generation.
+	DefaultTextSemanticTimeout = 180 * time.Second
+	// DefaultTextSemanticMaxGenerateTextBytes is the default upper bound on
+	// generated retrieval text stored in files.content_text for one durable file
+	// semantic generation task.
+	DefaultTextSemanticMaxGenerateTextBytes = 16 << 10 // 16 KiB
+	// DefaultTextSemanticMaxTokens is the default model output token cap for the
+	// OpenAI-compatible text semantic generator.
+	DefaultTextSemanticMaxTokens = 51200
 	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
@@ -46,8 +59,11 @@ type Options struct {
 	// TiDB auto-embedding path. Unlike async image extract, there is no in-process
 	// queue; work is delivered only via semantic_tasks when runtime is wired.
 	AsyncAudioExtract AsyncAudioExtractOptions
-	QueryEmbedding    QueryEmbeddingOptions
-	MaxUploadBytes    int64
+	// TextSemantic configures durable file-level semantic text generation for
+	// large or sync-insufficient direct-text files on the TiDB auto-embedding path.
+	TextSemantic   TextSemanticOptions
+	QueryEmbedding QueryEmbeddingOptions
+	MaxUploadBytes int64
 	// MaxTenantStorageBytes caps the total logical storage a single tenant may
 	// occupy across confirmed files plus in-flight upload reservations.
 	MaxTenantStorageBytes int64
@@ -62,6 +78,16 @@ type Options struct {
 	MaxMediaLLMFiles int64
 	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
 	LLMCostBudget LLMCostBudgetOptions
+	// MetaStore is the control-plane meta store. When set, LLM usage is
+	// recorded to (and budgets read from) the meta store instead of the
+	// per-tenant datastore.
+	MetaStore MetaLLMUsageStore
+	// TenantID identifies this tenant in the meta store's llm_usage table.
+	TenantID string
+	// LLMUsageDualRead enables dual-read mode during transition: budget checks
+	// sum costs from both meta store and tenant datastore. Set this to true
+	// during the first month of migration to avoid mid-month budget resets.
+	LLMUsageDualRead bool
 	// QuotaSource selects where quota enforcement reads authoritative state.
 	// "tenant" (default) uses per-tenant DB; "server" uses the central server DB.
 	QuotaSource QuotaSource
@@ -74,6 +100,9 @@ type LLMCostBudgetOptions struct {
 	MaxMonthlyMillicents int64
 	// VisionCostPerKTokenMillicents is the cost per 1K tokens for Vision API calls.
 	VisionCostPerKTokenMillicents int64
+	// TextSemanticCostPerKTokenMillicents is the cost per 1K tokens for file
+	// semantic text generation models.
+	TextSemanticCostPerKTokenMillicents int64
 	// AudioLLMCostPerKTokenMillicents is the cost per 1K tokens for token-based
 	// audio models (e.g. gpt-4o-transcribe).
 	AudioLLMCostPerKTokenMillicents int64
@@ -83,6 +112,10 @@ type LLMCostBudgetOptions struct {
 	// FallbackImageCostMillicents is used when the Vision API does not return
 	// token usage. Must be > 0 for cost tracking to work with such providers.
 	FallbackImageCostMillicents int64
+	// FallbackTextSemanticCostMillicents is used when the text semantic model
+	// does not return token usage. Must be > 0 for cost tracking to work with
+	// such providers.
+	FallbackTextSemanticCostMillicents int64
 	// FallbackAudioCostMillicents is used when the audio API returns neither
 	// duration nor token usage. Must be > 0 for cost tracking to work.
 	FallbackAudioCostMillicents int64
@@ -124,6 +157,21 @@ func AsyncAudioExtractWillWireRuntime(opts AsyncAudioExtractOptions) bool {
 	return opts.Enabled && opts.Extractor != nil
 }
 
+// TextSemanticOptions configures durable file-level semantic text generation.
+type TextSemanticOptions struct {
+	Enabled              bool
+	MaxSourceBytes       int64
+	TaskTimeout          time.Duration
+	MaxGenerateTextBytes int
+	Generator            TextSemanticGenerator
+}
+
+// TextSemanticWillWireRuntime reports whether file-level text semantic
+// generation will be wired on a Dat9Backend built from opts.
+func TextSemanticWillWireRuntime(opts TextSemanticOptions) bool {
+	return opts.Enabled
+}
+
 // QueryEmbeddingOptions controls app-side query embedding for semantic search.
 type QueryEmbeddingOptions struct {
 	Client embedding.Client
@@ -155,10 +203,16 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	cb := opts.LLMCostBudget
 	b.maxMonthlyLLMCostMillicents = cb.MaxMonthlyMillicents
 	b.visionCostPerKTokenMillicents = cb.VisionCostPerKTokenMillicents
+	b.textSemanticCostPerKTokenMillicents = cb.TextSemanticCostPerKTokenMillicents
 	b.audioLLMCostPerKTokenMillicents = cb.AudioLLMCostPerKTokenMillicents
 	b.whisperCostPerMinuteMillicents = cb.WhisperCostPerMinuteMillicents
 	b.fallbackImageCostMillicents = cb.FallbackImageCostMillicents
+	b.fallbackTextSemanticCostMillicents = cb.FallbackTextSemanticCostMillicents
 	b.fallbackAudioCostMillicents = cb.FallbackAudioCostMillicents
+
+	b.metaLLMStore = opts.MetaStore
+	b.tenantID = opts.TenantID
+	b.llmUsageDualRead = opts.LLMUsageDualRead
 
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client
@@ -233,6 +287,32 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 			zap.Int64("max_audio_bytes", a.MaxAudioBytes),
 			zap.Int("max_extract_text_bytes", a.MaxExtractTextBytes),
 			zap.String("extractor_type", fmt.Sprintf("%T", a.Extractor)))
+	}
+
+	t := opts.TextSemantic
+	if TextSemanticWillWireRuntime(t) {
+		if t.MaxSourceBytes <= 0 {
+			t.MaxSourceBytes = DefaultTextSemanticMaxSourceBytes
+		}
+		if t.TaskTimeout <= 0 {
+			t.TaskTimeout = DefaultTextSemanticTimeout
+		}
+		if t.MaxGenerateTextBytes <= 0 {
+			t.MaxGenerateTextBytes = DefaultTextSemanticMaxGenerateTextBytes
+		}
+		if t.Generator == nil {
+			t.Generator = NewBasicTextSemanticGenerator()
+		}
+		b.textSemanticEnabled = true
+		b.textSemanticGenerator = t.Generator
+		b.textSemanticTimeout = t.TaskTimeout
+		b.textSemanticMaxSourceBytes = t.MaxSourceBytes
+		b.maxTextSemanticTextBytes = t.MaxGenerateTextBytes
+		logger.Info(backgroundWithTrace(), "backend_text_semantic_runtime_configured",
+			zap.Duration("task_timeout", t.TaskTimeout),
+			zap.Int64("max_source_bytes", t.MaxSourceBytes),
+			zap.Int("max_generate_text_bytes", t.MaxGenerateTextBytes),
+			zap.String("generator_type", fmt.Sprintf("%T", t.Generator)))
 	}
 }
 

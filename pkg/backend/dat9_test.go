@@ -85,6 +85,15 @@ func TestAsyncImageExtractWillWireRuntime(t *testing.T) {
 	}
 }
 
+func TestTextSemanticWillWireRuntime(t *testing.T) {
+	if TextSemanticWillWireRuntime(TextSemanticOptions{}) {
+		t.Fatal("disabled text semantic runtime should not wire")
+	}
+	if !TextSemanticWillWireRuntime(TextSemanticOptions{Enabled: true}) {
+		t.Fatal("enabled text semantic runtime should wire")
+	}
+}
+
 func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 	t.Run("app_managed_default", func(t *testing.T) {
 		b := newTestBackend(t)
@@ -155,6 +164,19 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 		got := b.AutoSemanticTaskTypes()
 		if len(got) != 2 || got[0] != semantic.TaskTypeImgExtractText || got[1] != semantic.TaskTypeAudioExtractText {
 			t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", got)
+		}
+	})
+	t.Run("auto_mode_with_file_semantic_task_contract", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{
+			DatabaseAutoEmbedding: true,
+			TextSemantic: TextSemanticOptions{
+				Enabled:   true,
+				Generator: NewBasicTextSemanticGenerator(),
+			},
+		})
+		got := b.AutoSemanticTaskTypes()
+		if len(got) != 1 || got[0] != semantic.TaskTypeGenerateFileSemanticText {
+			t.Fatalf("got %#v, want [generate_file_semantic_text]", got)
 		}
 	})
 }

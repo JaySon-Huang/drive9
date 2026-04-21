@@ -65,27 +65,42 @@ func (e *gatedSemanticEmbedder) EmbedText(context.Context, string) ([]float32, e
 }
 
 type staticServerImageExtractor struct {
-	text string
-	err  error
+	text  string
+	usage backend.ImageExtractUsage
+	err   error
 }
 
 func (e staticServerImageExtractor) ExtractImageText(_ context.Context, _ backend.ImageExtractRequest) (string, backend.ImageExtractUsage, error) {
 	if e.err != nil {
 		return "", backend.ImageExtractUsage{}, e.err
 	}
-	return e.text, backend.ImageExtractUsage{}, nil
+	return e.text, e.usage, nil
 }
 
 type staticServerAudioExtractor struct {
-	text string
-	err  error
+	text  string
+	usage backend.AudioExtractUsage
+	err   error
 }
 
 func (e staticServerAudioExtractor) ExtractAudioText(_ context.Context, _ backend.AudioExtractRequest) (string, backend.AudioExtractUsage, error) {
 	if e.err != nil {
 		return "", backend.AudioExtractUsage{}, e.err
 	}
-	return e.text, backend.AudioExtractUsage{}, nil
+	return e.text, e.usage, nil
+}
+
+type staticTextSemanticGenerator struct {
+	text  string
+	usage backend.TextSemanticUsage
+	err   error
+}
+
+func (g staticTextSemanticGenerator) GenerateFileSemanticText(_ context.Context, _ backend.TextSemanticRequest) (string, backend.TextSemanticUsage, error) {
+	if g.err != nil {
+		return "", backend.TextSemanticUsage{}, g.err
+	}
+	return g.text, g.usage, nil
 }
 
 func newTestTenantPool(t *testing.T) *tenant.Pool {
@@ -203,11 +218,17 @@ func TestSemanticWorkerProcessesEmbedTask(t *testing.T) {
 func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
+		LLMCostBudget: backend.LLMCostBudgetOptions{
+			VisionCostPerKTokenMillicents: 1000,
+		},
 		AsyncImageExtract: backend.AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,
 			QueueSize: 8,
-			Extractor: staticServerImageExtractor{text: "cat on sofa screenshot invoice"},
+			Extractor: staticServerImageExtractor{
+				text:  "cat on sofa screenshot invoice",
+				usage: backend.ImageExtractUsage{PromptTokens: 90, CompletionTokens: 30},
+			},
 		},
 	})
 	fileID := insertServerImageFileForExtractTest(t, b, "/img/worker.png", "image/png", []byte("fake-png"))
@@ -247,14 +268,24 @@ func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) {
 		t.Fatalf("unexpected semantic task rows: %+v", tasks)
 	}
+	usage := mustServerLLMUsage(t, b, "img-task-1")
+	if usage.TaskType != "img_extract_text" || usage.TaskID != "img-task-1" {
+		t.Fatalf("unexpected llm_usage row: %+v", usage)
+	}
 }
 
 func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
+		LLMCostBudget: backend.LLMCostBudgetOptions{
+			AudioLLMCostPerKTokenMillicents: 1000,
+		},
 		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
-			Enabled:   true,
-			Extractor: staticServerAudioExtractor{text: "hello from audio worker"},
+			Enabled: true,
+			Extractor: staticServerAudioExtractor{
+				text:  "hello from audio worker",
+				usage: backend.AudioExtractUsage{InputTokens: 120, OutputTokens: 30},
+			},
 		},
 	})
 	fileID := insertServerImageFileForExtractTest(t, b, "/rec/worker.mp3", "audio/mpeg", []byte{0xff, 0xf3})
@@ -293,6 +324,10 @@ func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
 	waitForNamedTaskStatus(t, b, "audio-task-1", string(semantic.TaskSucceeded), 3*time.Second)
 	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeAudioExtractText) {
 		t.Fatalf("unexpected semantic task rows: %+v", tasks)
+	}
+	usage := mustServerLLMUsage(t, b, "audio-task-1")
+	if usage.TaskType != "audio_extract_text" || usage.TaskID != "audio-task-1" {
+		t.Fatalf("unexpected llm_usage row: %+v", usage)
 	}
 }
 
@@ -589,6 +624,19 @@ func TestSemanticWorkerTaskTypesForTarget(t *testing.T) {
 			t.Fatalf("got %#v, missing %v", gotBoth, want)
 		}
 	}
+
+	bText := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		TextSemantic: backend.TextSemanticOptions{
+			Enabled:   true,
+			Generator: staticTextSemanticGenerator{text: "semantic_text_format: drive9-file-semantic/v1\npurpose:\n- file\nkey_topics:\n- topic\nimportant_identifiers:\n- ident\nstructure:\n- section\nsemantic_summary:\nsummary"},
+		},
+	})
+	mText := newSemanticWorkerManager(bText, nil, nil, nil, SemanticWorkerOptions{})
+	gotText := mText.taskTypesForTarget(bText)
+	if len(gotText) != 1 || gotText[0] != semantic.TaskTypeGenerateFileSemanticText {
+		t.Fatalf("got %#v, want generate_file_semantic_text", gotText)
+	}
 }
 
 func TestSemanticWorkerTaskTypesForTargetNilWithoutEmbedder(t *testing.T) {
@@ -705,6 +753,46 @@ func TestSemanticWorkerManagerNilWhenMultiTenantOnlyFallbackHasAutoTasks(t *test
 	if m != nil {
 		t.Fatal("expected nil manager: multi-tenant listTenantRefs never schedules fallback, so fallback-only auto types are unreachable")
 	}
+}
+
+func TestValidateDurableSemanticTasksRequireSemanticWorker(t *testing.T) {
+	semanticText := "semantic_text_format: drive9-file-semantic/v1\npurpose:\n- file\nkey_topics:\n- topic\nimportant_identifiers:\n- ident\nstructure:\n- section\nsemantic_summary:\nsummary"
+
+	t.Run("rejects_text_semantic_without_worker", func(t *testing.T) {
+		err := ValidateDurableSemanticTasksRequireSemanticWorker(Config{}, backend.Options{
+			TextSemantic: backend.TextSemanticOptions{Enabled: true},
+		}, false)
+		if err == nil {
+			t.Fatal("expected validation failure without worker")
+		}
+		if !strings.Contains(err.Error(), "generate_file_semantic_text") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("skips_local_validation_when_auto_embedding_disabled", func(t *testing.T) {
+		err := ValidateDurableSemanticTasksRequireSemanticWorker(Config{}, backend.Options{
+			TextSemantic: backend.TextSemanticOptions{Enabled: true},
+		}, true)
+		if err != nil {
+			t.Fatalf("expected local non-auto template to skip validation, got %v", err)
+		}
+	})
+
+	t.Run("accepts_single_tenant_text_semantic_worker", func(t *testing.T) {
+		opts := backend.Options{
+			DatabaseAutoEmbedding: true,
+			TextSemantic: backend.TextSemanticOptions{
+				Enabled:   true,
+				Generator: staticTextSemanticGenerator{text: semanticText},
+			},
+		}
+		b := newTestBackendForSemanticWorkerWithOptions(t, opts)
+		err := ValidateDurableSemanticTasksRequireSemanticWorker(Config{Backend: b}, opts, true)
+		if err != nil {
+			t.Fatalf("expected viable fallback worker, got %v", err)
+		}
+	})
 }
 
 func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
@@ -1424,6 +1512,63 @@ func TestSemanticWorkerDoesNotClaimUnsupportedTaskType(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerProcessesFileSemanticTask(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		LLMCostBudget: backend.LLMCostBudgetOptions{
+			TextSemanticCostPerKTokenMillicents: 1000,
+		},
+		TextSemantic: backend.TextSemanticOptions{
+			Enabled: true,
+			Generator: staticTextSemanticGenerator{
+				text:  "semantic_text_format: drive9-file-semantic/v1\npurpose:\n- worker path\nkey_topics:\n- retrieval\nimportant_identifiers:\n- GenerateFileSemanticText\nstructure:\n- section_1: intro\nsemantic_summary:\nworker summary",
+				usage: backend.TextSemanticUsage{PromptTokens: 140, CompletionTokens: 20},
+			},
+		},
+	})
+	fileID := insertServerTextFileForSemanticTest(t, b, "/docs/worker-large.txt", "text/plain", []byte("line one\nline two\nline three"))
+	payload, err := json.Marshal(semantic.FileSemanticTaskPayload{Path: "/docs/worker-large.txt", ContentType: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "file-semantic-task-1",
+		TaskType:        semantic.TaskTypeGenerateFileSemanticText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     5,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+
+	waitForTaskStatus(t, b, fileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+	nf := mustServerFile(t, b, "/docs/worker-large.txt")
+	if !strings.Contains(nf.ContentText, "drive9-file-semantic/v1") {
+		t.Fatalf("content_text=%q, want structured semantic text", nf.ContentText)
+	}
+	if !strings.Contains(nf.ContentText, "worker summary") {
+		t.Fatalf("content_text=%q, want generated summary", nf.ContentText)
+	}
+	usage := mustServerLLMUsage(t, b, "file-semantic-task-1")
+	if usage.TaskType != "generate_file_semantic_text" || usage.TaskID != "file-semantic-task-1" {
+		t.Fatalf("unexpected llm_usage row: %+v", usage)
+	}
+}
+
 func TestSemanticWorkerRetryDelayHonorsConfiguredMax(t *testing.T) {
 	m := newSemanticWorkerManager(newTestBackendForSemanticWorker(t), nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{
 		RetryBaseDelay: 200 * time.Millisecond,
@@ -1467,10 +1612,23 @@ type serverSemanticTaskState struct {
 	LastError    string
 }
 
+type serverLLMUsageRow struct {
+	TaskType       string
+	TaskID         string
+	CostMillicents int64
+	RawUnits       int64
+	RawUnitType    string
+}
+
 func insertServerImageFileForExtractTest(t *testing.T, b *backend.Dat9Backend, path, contentType string, data []byte) string {
 	t.Helper()
 	fileID := mustServerImageFileID(t, b, path, contentType, data)
 	return fileID
+}
+
+func insertServerTextFileForSemanticTest(t *testing.T, b *backend.Dat9Backend, path, contentType string, data []byte) string {
+	t.Helper()
+	return mustServerImageFileID(t, b, path, contentType, data)
 }
 
 func mustServerImageFileID(t *testing.T, b *backend.Dat9Backend, path, contentType string, data []byte) string {
@@ -1565,6 +1723,23 @@ func mustGetServerSemanticTask(t *testing.T, b *backend.Dat9Backend, taskID stri
 		t.Fatalf("get semantic task %s: %v", taskID, err)
 	}
 	return task
+}
+
+func mustServerLLMUsage(t *testing.T, b *backend.Dat9Backend, taskID string) serverLLMUsageRow {
+	t.Helper()
+	var row serverLLMUsageRow
+	err := b.Store().DB().QueryRow(`SELECT task_type, task_id, cost_millicents, raw_units, raw_unit_type
+		FROM llm_usage WHERE task_id = ? ORDER BY created_at DESC LIMIT 1`, taskID).Scan(
+		&row.TaskType,
+		&row.TaskID,
+		&row.CostMillicents,
+		&row.RawUnits,
+		&row.RawUnitType,
+	)
+	if err != nil {
+		t.Fatalf("get llm_usage %s: %v", taskID, err)
+	}
+	return row
 }
 
 func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastore.File {

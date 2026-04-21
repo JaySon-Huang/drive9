@@ -69,13 +69,26 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
+	// File-level semantic text generation for large direct-text files.
+	textSemanticEnabled        bool
+	textSemanticGenerator      TextSemanticGenerator
+	textSemanticTimeout        time.Duration
+	textSemanticMaxSourceBytes int64
+	maxTextSemanticTextBytes   int
+
 	// Monthly LLM cost budget (P1).
-	maxMonthlyLLMCostMillicents     int64
-	visionCostPerKTokenMillicents   int64
-	audioLLMCostPerKTokenMillicents int64
-	whisperCostPerMinuteMillicents  int64
-	fallbackImageCostMillicents     int64
-	fallbackAudioCostMillicents     int64
+	maxMonthlyLLMCostMillicents         int64
+	visionCostPerKTokenMillicents       int64
+	textSemanticCostPerKTokenMillicents int64
+	audioLLMCostPerKTokenMillicents     int64
+	whisperCostPerMinuteMillicents      int64
+	fallbackImageCostMillicents         int64
+	fallbackTextSemanticCostMillicents  int64
+	fallbackAudioCostMillicents         int64
+
+	// Control-plane LLM usage (meta store migration).
+	metaLLMStore     MetaLLMUsageStore // nil = write to tenant datastore only
+	llmUsageDualRead bool
 }
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
@@ -414,7 +427,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			return err
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, int64(len(data)), contentText)
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
@@ -525,7 +538,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 			return txErr
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType, int64(len(finalData)), contentText)
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
@@ -758,6 +771,35 @@ func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([
 	return nil, fmt.Errorf("unsupported storage type for direct read: %s", f.StorageType)
 }
 
+func (b *Dat9Backend) readFileDataUpToCtx(ctx context.Context, f *datastore.File, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return b.readFileDataCtx(ctx, f)
+	}
+	if f == nil {
+		return nil, fmt.Errorf("nil file")
+	}
+	if f.StorageType == datastore.StorageS3 {
+		if b.s3 == nil {
+			return nil, fmt.Errorf("s3 client not configured")
+		}
+		rc, err := b.s3.GetObject(ctx, f.StorageRef)
+		if err != nil {
+			logger.Error(ctx, "backend_read_get_object_failed", zap.String("storage_ref", f.StorageRef), zap.Error(err))
+			return nil, err
+		}
+		defer func() { _ = rc.Close() }()
+		return io.ReadAll(io.LimitReader(rc, maxBytes))
+	}
+	if f.StorageType == datastore.StorageDB9 {
+		data := f.ContentBlob
+		if int64(len(data)) > maxBytes {
+			data = data[:maxBytes]
+		}
+		return append([]byte(nil), data...), nil
+	}
+	return nil, fmt.Errorf("unsupported storage type for bounded direct read: %s", f.StorageType)
+}
+
 func (b *Dat9Backend) shouldStoreInDB(size int64) bool {
 	return b.smallInDB && size < smallFileThreshold
 }
@@ -842,6 +884,10 @@ func sha256sum(data []byte) string {
 func detectContentType(path string, data []byte) string {
 	ext := pathutil.Ext(path)
 	if ext != "" {
+		switch strings.ToLower(ext) {
+		case ".md", ".markdown":
+			return "text/markdown"
+		}
 		if ct := mime.TypeByExtension(ext); ct != "" {
 			return ct
 		}

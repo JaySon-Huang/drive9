@@ -5,14 +5,18 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/buffer"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 const envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
+const humanDateTimeLayout = "2006/01/02 15:04:05.000 -07:00"
+const drive9JSONEncoderName = "drive9-json"
 
 const (
 	benchTimingLogUnknown uint32 = iota
@@ -22,8 +26,52 @@ const (
 
 var benchTimingLogState atomic.Uint32
 
+var (
+	drive9JSONEncoderOnce sync.Once
+	drive9JSONEncoderErr  error
+)
+
+type humanDateTimeEncoder struct {
+	zapcore.Encoder
+}
+
+func (e humanDateTimeEncoder) Clone() zapcore.Encoder {
+	return humanDateTimeEncoder{Encoder: e.Encoder.Clone()}
+}
+
+func (e humanDateTimeEncoder) EncodeEntry(ent zapcore.Entry, fields []zapcore.Field) (*buffer.Buffer, error) {
+	augmented := make([]zapcore.Field, 0, len(fields)+1)
+	augmented = append(augmented, fields...)
+	augmented = append(augmented, zap.String("date_time", ent.Time.Format(humanDateTimeLayout)))
+	return e.Encoder.EncodeEntry(ent, augmented)
+}
+
+func newHumanDateTimeJSONEncoder(cfg zapcore.EncoderConfig) zapcore.Encoder {
+	return humanDateTimeEncoder{Encoder: zapcore.NewJSONEncoder(cfg)}
+}
+
+func registerDrive9JSONEncoder() error {
+	drive9JSONEncoderOnce.Do(func() {
+		drive9JSONEncoderErr = zap.RegisterEncoder(
+			drive9JSONEncoderName,
+			func(cfg zapcore.EncoderConfig) (zapcore.Encoder, error) {
+				return newHumanDateTimeJSONEncoder(cfg), nil
+			},
+		)
+	})
+	return drive9JSONEncoderErr
+}
+
 func NewServerLogger() (*zap.Logger, error) {
-	return zap.NewProduction()
+	// Register a custom encoder instead of replacing the core with WrapCore so
+	// zap's production Build path keeps its default sampling, caller, and
+	// stacktrace behavior while we add a human-readable date_time field.
+	if err := registerDrive9JSONEncoder(); err != nil {
+		return nil, err
+	}
+	cfg := zap.NewProductionConfig()
+	cfg.Encoding = drive9JSONEncoderName
+	return cfg.Build()
 }
 
 func BenchTimingLogEnabled() bool {
@@ -91,7 +139,7 @@ func NewCLILogger() (*zap.Logger, error) {
 
 	encoderCfg := zap.NewProductionEncoderConfig()
 	core := zapcore.NewCore(
-		zapcore.NewJSONEncoder(encoderCfg),
+		newHumanDateTimeJSONEncoder(encoderCfg),
 		zapcore.AddSync(rotate),
 		zap.InfoLevel,
 	)

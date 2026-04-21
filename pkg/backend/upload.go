@@ -958,7 +958,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				contentTextForEnqueue := ""
+				if upload.TotalSize <= smallFileThreshold {
+					// Multipart finalize only knows path + stored content type. For the
+					// initial MIME-only Phase 1 closure, small uploads stay on the
+					// synchronous path unless we have explicit sync insufficiency proof.
+					contentTextForEnqueue = "sync_text_unknown"
+				}
+				err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType, upload.TotalSize, contentTextForEnqueue)
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
 			}
@@ -1025,7 +1032,13 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		insertNodeDurationMs = uploadPhaseMs(stepStart)
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			contentTextForEnqueue := ""
+			if upload.TotalSize <= smallFileThreshold {
+				// Multipart finalize cannot inspect uploaded bytes here, so the Phase 1
+				// direct-text task claims only the large-upload branch.
+				contentTextForEnqueue = "sync_text_unknown"
+			}
+			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType, upload.TotalSize, contentTextForEnqueue)
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}

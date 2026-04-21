@@ -102,9 +102,8 @@ func SemanticWorkerWillRun(cfg Config) bool {
 	return newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers) != nil
 }
 
-// ValidateDurableAsyncExtractRequiresSemanticWorker returns an error when async
-// image or audio extraction runtimes are enabled on the backend template (so
-// durable TiDB-auto semantic tasks may be enqueued for matching tenants) but the
+// ValidateDurableSemanticTasksRequireSemanticWorker returns an error when
+// durable TiDB-auto semantic tasks are enabled on the backend template but the
 // semantic worker would not start for cfg.
 //
 // When localTiDBAutoOnly is true, validation applies only if
@@ -112,10 +111,9 @@ func SemanticWorkerWillRun(cfg Config) bool {
 // embedding mode). When false (drive9-server with a tenant pool), the template
 // may leave DatabaseAutoEmbedding unset because per-tenant backends set it during
 // pool createBackend; in that case validation always runs when a runtime wires.
-func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
-	willWire := backend.AsyncImageExtractWillWireRuntime(template.AsyncImageExtract) ||
-		backend.AsyncAudioExtractWillWireRuntime(template.AsyncAudioExtract)
-	if !willWire {
+func ValidateDurableSemanticTasksRequireSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
+	taskTypes := backend.ConfiguredAutoSemanticTaskTypes(template)
+	if !hasAnyTaskTypes(taskTypes) {
 		return nil
 	}
 	if localTiDBAutoOnly && !template.DatabaseAutoEmbedding {
@@ -124,7 +122,14 @@ func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template back
 	if SemanticWorkerWillRun(cfg) {
 		return nil
 	}
-	return fmt.Errorf("semantic worker would not start but durable async image/audio extract is enabled; configure DRIVE9_EMBED_* for app-managed embedding or fix worker/task-type routing so img_extract_text and audio_extract_text can be claimed")
+	typeNames := strings.Join(semanticWorkerLogTaskTypesFromTypes(taskTypes), ", ")
+	return fmt.Errorf("semantic worker would not start but durable TiDB-auto semantic tasks are enabled (%s); configure DRIVE9_EMBED_* for app-managed embedding or fix worker/task-type routing so these task types can be claimed", typeNames)
+}
+
+// ValidateDurableAsyncExtractRequiresSemanticWorker preserves the old startup
+// validation entrypoint while delegating to the generic semantic-task version.
+func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
+	return ValidateDurableSemanticTasksRequireSemanticWorker(cfg, template, localTiDBAutoOnly)
 }
 
 type semanticWorkerManager struct {
@@ -649,10 +654,23 @@ func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semant
 		return m.processImgExtractTask(ctx, target.backend, task)
 	case semantic.TaskTypeAudioExtractText:
 		return m.processAudioExtractTask(ctx, target.backend, task)
+	case semantic.TaskTypeGenerateFileSemanticText:
+		return m.processFileSemanticTask(ctx, target.backend, task)
 	default:
 		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
 	}
+}
+
+func (m *semanticWorkerManager) processFileSemanticTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
+	result, err := b.ProcessFileSemanticTask(ctx, textSemanticTaskSpecFromSemanticTask(task))
+	if err != nil {
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
+	}
+	if result == backend.TextSemanticResultBudgetExhausted {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
+	}
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result)}
 }
 
 func (m *semanticWorkerManager) startTaskLeaseExecution(ctx context.Context, target *semanticTarget, task *semantic.Task) *semanticTaskLeaseExecution {
@@ -1106,7 +1124,7 @@ func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtr
 	if task == nil {
 		return backend.ImageExtractTaskSpec{}
 	}
-	spec := backend.ImageExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	spec := backend.ImageExtractTaskSpec{TaskID: task.TaskID, FileID: task.ResourceID, Revision: task.ResourceVersion}
 	if len(task.PayloadJSON) == 0 {
 		return spec
 	}
@@ -1122,11 +1140,27 @@ func audioExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.AudioExtr
 	if task == nil {
 		return backend.AudioExtractTaskSpec{}
 	}
-	spec := backend.AudioExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	spec := backend.AudioExtractTaskSpec{TaskID: task.TaskID, FileID: task.ResourceID, Revision: task.ResourceVersion}
 	if len(task.PayloadJSON) == 0 {
 		return spec
 	}
 	var payload semantic.AudioExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
+		spec.Path = payload.Path
+		spec.ContentType = payload.ContentType
+	}
+	return spec
+}
+
+func textSemanticTaskSpecFromSemanticTask(task *semantic.Task) backend.TextSemanticTaskSpec {
+	if task == nil {
+		return backend.TextSemanticTaskSpec{}
+	}
+	spec := backend.TextSemanticTaskSpec{TaskID: task.TaskID, FileID: task.ResourceID, Revision: task.ResourceVersion}
+	if len(task.PayloadJSON) == 0 {
+		return spec
+	}
+	var payload semantic.FileSemanticTaskPayload
 	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
 		spec.Path = payload.Path
 		spec.ContentType = payload.ContentType

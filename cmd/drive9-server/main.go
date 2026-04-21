@@ -234,12 +234,12 @@ func main() {
 			defer expirySweepWorker.Stop()
 		}
 
-		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
+		// TODO: Run ValidateDurableSemanticTasksRequireSemanticWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
 		// (database auto-embedding: tidb_zero, tidb_cloud_starter). pool != nil is too broad
 		// for db9-only pools, which never hit that path but still get forced to configure
 		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
-		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+		if err := server.ValidateDurableSemanticTasksRequireSemanticWorker(server.Config{
 			Meta:             store,
 			Pool:             pool,
 			Provisioner:      provisioner,
@@ -387,7 +387,7 @@ environment:
   DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
-  Audio extraction (async audio -> text for search; MVP durable path is TiDB auto-embedding only):
+  Audio extraction (async audio -> text for search; TiDB auto-embedding only):
   Durable audio_extract_text tasks enqueue only for tenants with database auto-embedding
   (tidb_zero / tidb_cloud_starter). For db9-only or other app-managed tenants these vars do
   not enable that semantic_tasks pipeline. When enabled, explicit provider wiring is required:
@@ -399,11 +399,26 @@ environment:
   DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required when enabled)
   DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required when enabled)
   DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription
+  File semantic text generation (durable text-like semantic closure; TiDB auto-embedding only):
+  DRIVE9_TEXT_SEMANTIC_ENABLED true|false (default: false)
+  DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES max source bytes loaded per task (default: %d)
+  DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS generator timeout seconds (default: %d)
+  DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES max generated retrieval text stored in files.content_text (default: %d)
+  DRIVE9_TEXT_SEMANTIC_API_BASE OpenAI-compatible base URL (optional; enables remote generator when set with key+model)
+  DRIVE9_TEXT_SEMANTIC_API_KEY  API key for DRIVE9_TEXT_SEMANTIC_API_BASE (optional; required with API_BASE+MODEL)
+  DRIVE9_TEXT_SEMANTIC_MODEL    model name for text semantic generation (optional; required with API_BASE+API_KEY)
+  DRIVE9_TEXT_SEMANTIC_PROMPT   custom generation prompt (optional)
+  DRIVE9_TEXT_SEMANTIC_MAX_TOKENS max model output tokens (default: %d)
 
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes)
+`,
+		server.DefaultMaxUploadBytes,
+		backend.DefaultTextSemanticMaxSourceBytes,
+		int(backend.DefaultTextSemanticTimeout/time.Second),
+		backend.DefaultTextSemanticMaxGenerateTextBytes,
+		backend.DefaultTextSemanticMaxTokens)
 	os.Exit(exitCode)
 }
 
@@ -565,6 +580,50 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 		}
 		logger.Info(context.Background(), "audio_extract_mode_openai_compatible",
 			zap.String("model", audioModel), zap.String("base_url", audioBaseURL))
+	}
+	if envBool("DRIVE9_TEXT_SEMANTIC_ENABLED", false) {
+		textSemantic := backend.TextSemanticOptions{
+			Enabled:              true,
+			MaxSourceBytes:       envInt64("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", backend.DefaultTextSemanticMaxSourceBytes),
+			TaskTimeout:          time.Duration(envInt("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", int(backend.DefaultTextSemanticTimeout/time.Second))) * time.Second,
+			MaxGenerateTextBytes: envInt("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", backend.DefaultTextSemanticMaxGenerateTextBytes),
+		}
+		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_BASE"))
+		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_API_KEY"))
+		model := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_MODEL"))
+		prompt := strings.TrimSpace(os.Getenv("DRIVE9_TEXT_SEMANTIC_PROMPT"))
+		maxTokens := envInt("DRIVE9_TEXT_SEMANTIC_MAX_TOKENS", backend.DefaultTextSemanticMaxTokens)
+		configured := baseURL != "" || apiKey != "" || model != ""
+		if configured {
+			if baseURL == "" || apiKey == "" || model == "" {
+				return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_SEMANTIC_API_BASE, DRIVE9_TEXT_SEMANTIC_API_KEY and DRIVE9_TEXT_SEMANTIC_MODEL must be set together when DRIVE9_TEXT_SEMANTIC_ENABLED=true")
+			}
+			generator, err := backend.NewOpenAITextSemanticGenerator(backend.OpenAITextSemanticGeneratorConfig{
+				BaseURL:   baseURL,
+				APIKey:    apiKey,
+				Model:     model,
+				Prompt:    prompt,
+				MaxTokens: maxTokens,
+				Timeout:   textSemantic.TaskTimeout,
+			})
+			if err != nil {
+				return backend.Options{}, fmt.Errorf("init text semantic generator: %w", err)
+			}
+			textSemantic.Generator = generator
+			logger.Info(context.Background(), "text_semantic_mode_openai_compatible",
+				zap.String("model", model),
+				zap.String("base_url", baseURL),
+				zap.Int("max_tokens", maxTokens))
+		} else {
+			textSemantic.Generator = backend.NewBasicTextSemanticGenerator()
+			logger.Info(context.Background(), "text_semantic_mode_basic_fallback")
+		}
+		opts.TextSemantic = textSemantic
+		logger.Info(context.Background(), "text_semantic_runtime_configured",
+			zap.Int64("max_source_bytes", opts.TextSemantic.MaxSourceBytes),
+			zap.Duration("task_timeout", opts.TextSemantic.TaskTimeout),
+			zap.Int("max_text_bytes", opts.TextSemantic.MaxGenerateTextBytes),
+			zap.String("generator_type", fmt.Sprintf("%T", opts.TextSemantic.Generator)))
 	}
 	return opts, nil
 }

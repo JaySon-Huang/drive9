@@ -34,6 +34,9 @@ type ImageTextExtractor interface {
 // ImageExtractTaskSpec carries the revision-scoped inputs needed to extract
 // image text for one file version.
 type ImageExtractTaskSpec struct {
+	// TaskID is the durable semantic_tasks identity for this extraction job when
+	// it is dispatched by the semantic worker.
+	TaskID      string
 	FileID      string
 	Path        string
 	ContentType string
@@ -281,7 +284,11 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 	if err != nil {
 		return ImageExtractResultExtractError, fmt.Errorf("extract image text: %w", err)
 	}
-	b.recordImageExtractUsage(task.FileID, imageUsage)
+	usageTaskID := task.TaskID
+	if usageTaskID == "" {
+		usageTaskID = task.FileID
+	}
+	b.recordImageExtractUsage(usageTaskID, imageUsage)
 	text = sanitizeExtractedText(text, b.maxExtractTextBytes)
 	if text == "" {
 		return ImageExtractResultEmptyText, nil

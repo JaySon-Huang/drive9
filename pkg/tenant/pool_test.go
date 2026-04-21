@@ -233,19 +233,41 @@ func TestPoolAutoSemanticTaskTypes(t *testing.T) {
 		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: &poolDummyAudioExtractor{}},
 	}}, enc)
 	defer audioOnly.Close()
+	if !audioOnly.SupportsAsyncAudioExtract() {
+		t.Fatal("expected audio-only pool to report async audio support")
+	}
+	if audioOnly.SupportsFileSemanticTextGenerate() {
+		t.Fatal("audio-only pool should not report file semantic support")
+	}
 	gotAudio := audioOnly.AutoSemanticTaskTypes()
 	if len(gotAudio) != 1 || gotAudio[0] != semantic.TaskTypeAudioExtractText {
 		t.Fatalf("got %#v, want [audio_extract_text]", gotAudio)
 	}
 
+	textOnly := NewPool(PoolConfig{BackendOptions: backend.Options{
+		TextSemantic: backend.TextSemanticOptions{Enabled: true},
+	}}, enc)
+	defer textOnly.Close()
+	if !textOnly.SupportsFileSemanticTextGenerate() {
+		t.Fatal("expected text-only pool to report file semantic support")
+	}
+	if textOnly.SupportsAsyncAudioExtract() {
+		t.Fatal("text-only pool should not report async audio support")
+	}
+	gotText := textOnly.AutoSemanticTaskTypes()
+	if len(gotText) != 1 || gotText[0] != semantic.TaskTypeGenerateFileSemanticText {
+		t.Fatalf("got %#v, want [generate_file_semantic_text]", gotText)
+	}
+
 	both := NewPool(PoolConfig{BackendOptions: backend.Options{
 		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
 		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: &poolDummyAudioExtractor{}},
+		TextSemantic:      backend.TextSemanticOptions{Enabled: true},
 	}}, enc)
 	defer both.Close()
 	gotBoth := both.AutoSemanticTaskTypes()
-	if len(gotBoth) != 2 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText {
-		t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", gotBoth)
+	if len(gotBoth) != 3 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText || gotBoth[2] != semantic.TaskTypeGenerateFileSemanticText {
+		t.Fatalf("got %#v, want [img_extract_text audio_extract_text generate_file_semantic_text]", gotBoth)
 	}
 }
 

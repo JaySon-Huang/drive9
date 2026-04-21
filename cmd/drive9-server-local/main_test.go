@@ -480,6 +480,178 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	}
 }
 
+func TestBuildBackendOptionsFromEnvTextSemanticDisabled(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		envAudioExtractEnabled,
+		envAudioExtractMode,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+		"DRIVE9_TEXT_SEMANTIC_PROMPT",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TOKENS",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+	for _, k := range keys {
+		_ = os.Unsetenv(k)
+	}
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if backend.TextSemanticWillWireRuntime(opts.TextSemantic) {
+		t.Fatalf("expected text semantic runtime disabled, got %+v", opts.TextSemantic)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvTextSemanticEnabled(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		envAudioExtractEnabled,
+		envAudioExtractMode,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+		"DRIVE9_TEXT_SEMANTIC_PROMPT",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TOKENS",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+	for _, k := range keys {
+		_ = os.Unsetenv(k)
+	}
+
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_ENABLED", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_MAX_SOURCE_BYTES", "8192"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_TIMEOUT_SECONDS", "9"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_MAX_TEXT_BYTES", "3072"); err != nil {
+		t.Fatal(err)
+	}
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if !backend.TextSemanticWillWireRuntime(opts.TextSemantic) {
+		t.Fatalf("expected text semantic runtime wired, got %+v", opts.TextSemantic)
+	}
+	if opts.TextSemantic.MaxSourceBytes != 8192 {
+		t.Fatalf("MaxSourceBytes=%d, want 8192", opts.TextSemantic.MaxSourceBytes)
+	}
+	if got := opts.TextSemantic.TaskTimeout.Seconds(); got != 9 {
+		t.Fatalf("TaskTimeout=%v, want 9s", opts.TextSemantic.TaskTimeout)
+	}
+	if opts.TextSemantic.MaxGenerateTextBytes != 3072 {
+		t.Fatalf("MaxGenerateTextBytes=%d, want 3072", opts.TextSemantic.MaxGenerateTextBytes)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvTextSemanticOpenAI(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		envAudioExtractEnabled,
+		envAudioExtractMode,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
+		"DRIVE9_TEXT_SEMANTIC_ENABLED",
+		"DRIVE9_TEXT_SEMANTIC_API_BASE",
+		"DRIVE9_TEXT_SEMANTIC_API_KEY",
+		"DRIVE9_TEXT_SEMANTIC_MODEL",
+		"DRIVE9_TEXT_SEMANTIC_PROMPT",
+		"DRIVE9_TEXT_SEMANTIC_MAX_TOKENS",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+	for _, k := range keys {
+		_ = os.Unsetenv(k)
+	}
+
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_ENABLED", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_API_BASE", "https://example.com/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_API_KEY", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_TEXT_SEMANTIC_MODEL", "gpt-4.1-mini"); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if _, ok := opts.TextSemantic.Generator.(*backend.OpenAITextSemanticGenerator); !ok {
+		t.Fatalf("generator=%T, want *backend.OpenAITextSemanticGenerator", opts.TextSemantic.Generator)
+	}
+}
+
 func TestLocalStubAudioTextExtractorTranscript(t *testing.T) {
 	var ex localStubAudioTextExtractor
 	got, _, err := ex.ExtractAudioText(context.Background(), backend.AudioExtractRequest{Path: "/audio/clip.mp3"})
