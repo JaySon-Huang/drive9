@@ -1402,7 +1402,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Flags:       input.Flags,
 		Dirty:       wb,
 		IsNew:       true,
+		UnknownSize: true,
 		ShadowReady: false,
+	}
+	wb.LoadShadowPart = func(partIdx int) ([]byte, error) {
+		return fs.readShadowPart(childP, wb, partIdx)
 	}
 
 	if fs.shadowStore != nil && fs.pendingIndex != nil {
@@ -1419,10 +1423,16 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	// For non-sequential writes, falls back to flush-time UploadAll.
 	fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh))
 
-	// Wire up the OnPartFull callback: when a sequential write fills
-	// a part, submit it for background upload and evict after completion.
+	// For unknown-size creates, keep memory bounded via local shadow-backed
+	// eviction instead of starting multipart upload before the final size exists.
 	streamer := fh.Streamer
 	wb.OnPartFull = func(partIdx int, data []byte) {
+		if fh.UnknownSize {
+			if fh.ShadowReady {
+				fh.Dirty.EvictShadowPart(partIdx)
+			}
+			return
+		}
 		partNum := partIdx + 1
 		if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
 			fh.Lock()
@@ -1487,6 +1497,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 
 		fh.Dirty = NewWriteBuffer(p, maxPreloadSize, 0)
+		fh.Dirty.LoadShadowPart = func(partIdx int) ([]byte, error) {
+			return fs.readShadowPart(p, fh.Dirty, partIdx)
+		}
 
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
@@ -1527,6 +1540,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Dirty.maxSize = streamingWriteMaxSize
 			fh.Dirty.sequential = true
 			fh.Dirty.uploadedParts = make(map[int]bool)
+			fh.UnknownSize = true
 			_ = fh.Dirty.Truncate(0)
 			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
@@ -1539,11 +1553,18 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				}
 			}
 
-			// Attach streaming uploader with OnPartFull wiring.
+			// Keep the streamer attached so Flush can still use UploadAll with the
+			// final exact size, but avoid remote initiate while size is unknown.
 			fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh))
 			streamer := fh.Streamer
 			filePath := p
 			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
+				if fh.UnknownSize {
+					if fh.ShadowReady {
+						fh.Dirty.EvictShadowPart(partIdx)
+					}
+					return
+				}
 				partNum := partIdx + 1
 				if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
 					fh.Lock()
@@ -1578,6 +1599,51 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) readShadowPart(path string, wb *WriteBuffer, partIdx int) ([]byte, error) {
+	if fs.shadowStore == nil {
+		return nil, syscall.EIO
+	}
+	offset := int64(partIdx) * wb.PartSize()
+	if offset >= wb.Size() {
+		return nil, nil
+	}
+	length := wb.PartSize()
+	if end := offset + length; end > wb.Size() {
+		length = wb.Size() - offset
+	}
+	buf := make([]byte, length)
+	n, err := fs.shadowStore.ReadAt(path, offset, buf)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func (fs *Dat9FS) collectUploadAllPartsLocked(fh *FileHandle, size int64) (map[int][]byte, error) {
+	if fh == nil || fh.Dirty == nil {
+		return nil, syscall.EINVAL
+	}
+	numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
+	partSnapshots := make(map[int][]byte, numParts)
+	for pn := 1; pn <= numParts; pn++ {
+		partIdx := pn - 1
+		// Unknown-size create/O_TRUNC handles may evict full parts to shadow
+		// before Flush. Reload them on demand so UploadAll always sees exact bytes.
+		if fh.Dirty.IsShadowEvictedPart(partIdx) {
+			if err := fh.Dirty.EnsureLoaded(partIdx); err != nil {
+				return nil, err
+			}
+		}
+		src := fh.Dirty.PartData(pn)
+		if src != nil {
+			cp := make([]byte, len(src))
+			copy(cp, src)
+			partSnapshots[pn] = cp
+		}
+	}
+	return partSnapshots, nil
 }
 
 func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gofuse.ReadResult, gofuse.Status) {
@@ -2186,15 +2252,10 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= smallFileThreshold {
 		expectedRevision := fh.Streamer.ExpectedRevision()
-		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
-		partSnapshots := make(map[int][]byte, numParts)
-		for pn := 1; pn <= numParts; pn++ {
-			src := fh.Dirty.PartData(pn)
-			if src != nil {
-				cp := make([]byte, len(src))
-				copy(cp, src)
-				partSnapshots[pn] = cp
-			}
+		partSnapshots, collectErr := fs.collectUploadAllPartsLocked(fh, size)
+		if collectErr != nil {
+			log.Printf("collect upload parts failed for %s: %v", fh.Path, collectErr)
+			return gofuse.EIO
 		}
 
 		streamer := fh.Streamer

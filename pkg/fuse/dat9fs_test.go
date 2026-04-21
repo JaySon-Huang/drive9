@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,14 @@ func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http
 	fs := NewDat9FS(client.New(ts.URL, ""), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
 	return fs, ino, ts.Close
+}
+
+func fhForTest(fs *Dat9FS, fhID uint64) *FileHandle {
+	fh, ok := fs.fileHandles.Get(fhID)
+	if !ok {
+		return nil
+	}
+	return fh
 }
 
 func TestOpenWritableSmallFileLazyPreload(t *testing.T) {
@@ -181,6 +190,144 @@ func TestOpenTruncateWriteThroughShadow(t *testing.T) {
 	}
 	if n != 3 || string(buf) != "bye" {
 		t.Fatalf("shadow data = %q (%d), want bye (3)", buf[:n], n)
+	}
+}
+
+func TestCreateUnknownSizeFullPartDoesNotInitiateMultipart(t *testing.T) {
+	var initiateCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate" {
+			initiateCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR),
+	}, "stream.bin", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	data := bytes.Repeat([]byte("a"), int(DefaultPartSize))
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	if got := initiateCalls.Load(); got != 0 {
+		t.Fatalf("multipart initiate calls = %d, want 0", got)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.Dirty.IsShadowEvictedPart(0) {
+		t.Fatal("full part should be shadow-evicted for unknown-size create")
+	}
+	if fh.Streamer.HasStreamedParts() {
+		t.Fatal("streamer should not mark streamed parts before flush")
+	}
+}
+
+func TestOpenTruncateUnknownSizeFullPartDoesNotInitiateMultipart(t *testing.T) {
+	var initiateCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			initiateCalls.Add(1)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		case r.Method == http.MethodGet:
+			_, _ = io.WriteString(w, "old")
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	data := bytes.Repeat([]byte("b"), int(DefaultPartSize))
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	if got := initiateCalls.Load(); got != 0 {
+		t.Fatalf("multipart initiate calls = %d, want 0", got)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.Dirty.IsShadowEvictedPart(0) {
+		t.Fatal("full part should be shadow-evicted for unknown-size truncate")
+	}
+	if fh.Streamer.HasStreamedParts() {
+		t.Fatal("streamer should not mark streamed parts before flush")
 	}
 }
 
@@ -430,6 +577,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	var gotExpected atomic.Int64
 	gotExpected.Store(-1)
 	var completeParts int
+	var uploadURL string
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -462,11 +610,24 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 				},
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/presign-batch":
+			var req struct {
+				Parts []struct {
+					PartNumber int `json:"part_number"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if len(req.Parts) != 1 || req.Parts[0].PartNumber != 1 {
+				http.Error(w, "bad parts request", http.StatusBadRequest)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"parts": []map[string]any{{
 					"number":     1,
-					"url":        "http://" + r.Host + "/upload/1",
+					"url":        uploadURL,
 					"size":       fileSize,
 					"headers":    map[string]string{},
 					"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
@@ -494,6 +655,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
+	uploadURL = ts.URL + "/upload/1"
 
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -528,6 +690,136 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	if completeParts != 1 {
 		t.Fatalf("complete parts = %d, want 1", completeParts)
 	}
+}
+
+func TestFlushUnknownSizeCreateReloadsShadowEvictedPart(t *testing.T) {
+	const fileSize = int(DefaultPartSize) + 1024
+	data := bytes.Repeat([]byte("z"), fileSize)
+
+	var uploaded bytes.Buffer
+	var sawInitiate bool
+	var uploadURL string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			sawInitiate = true
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "up-1",
+				"key":         "blobs/up-1",
+				"part_size":   8 << 20,
+				"total_parts": 1,
+				"expires_at":  time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				"resumable":   false,
+				"checksum_contract": map[string]any{
+					"supported": []string{"SHA-256"},
+					"required":  false,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/presign-batch":
+			var req struct {
+				Parts []struct {
+					PartNumber int `json:"part_number"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if len(req.Parts) != 1 || req.Parts[0].PartNumber != 1 {
+				http.Error(w, "bad parts request", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []struct {
+					Number    int       `json:"number"`
+					URL       string    `json:"url"`
+					Size      int64     `json:"size"`
+					ExpiresAt time.Time `json:"expires_at"`
+				} `json:"parts"`
+			}{Parts: []struct {
+				Number    int       `json:"number"`
+				URL       string    `json:"url"`
+				Size      int64     `json:"size"`
+				ExpiresAt time.Time `json:"expires_at"`
+			}{{
+				Number:    1,
+				URL:       uploadURL,
+				Size:      int64(fileSize),
+				ExpiresAt: time.Now().Add(time.Minute),
+			}}})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/1":
+			uploaded.Reset()
+			_, _ = io.Copy(&uploaded, r.Body)
+			w.Header().Set("ETag", `"etag-1"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	uploadURL = ts.URL + "/upload/1"
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR),
+	}, "upload.bin", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle")
+	}
+	fh.Lock()
+	if !fh.Dirty.IsShadowEvictedPart(0) {
+		fh.Unlock()
+		t.Fatal("first full part should be shadow-evicted before flush")
+	}
+	partSnapshots, err := fs.collectUploadAllPartsLocked(fh, int64(fileSize))
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("collectUploadAllPartsLocked error = %v", err)
+	}
+	if got := partSnapshots[1]; !bytes.Equal(got, data[:DefaultPartSize]) {
+		t.Fatalf("collected part 1 mismatch: got %d bytes want %d", len(got), DefaultPartSize)
+	}
+	if got := partSnapshots[2]; !bytes.Equal(got, data[DefaultPartSize:]) {
+		t.Fatalf("collected part 2 mismatch: got %d bytes want %d", len(got), len(data)-int(DefaultPartSize))
+	}
+
+	_ = sawInitiate
+	_ = uploaded
 }
 
 func TestWriteBufferCanMaterializeFull(t *testing.T) {
