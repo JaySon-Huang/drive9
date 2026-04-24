@@ -17,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
+	"go.uber.org/zap"
 )
 
 // Client is the dat9 HTTP client.
@@ -257,6 +259,19 @@ func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []by
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string) error {
+	start := time.Now()
+	statusCode := 0
+	defer func() {
+		logger.InfoBenchTiming(ctx, "bench_trace_client",
+			zap.String("op", "write"),
+			zap.String("method", http.MethodPut),
+			zap.String("path", path),
+			zap.Int("bytes", len(data)),
+			zap.Int64("expected_revision", expectedRevision),
+			zap.Int("status_code", statusCode),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -273,6 +288,7 @@ func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, d
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	statusCode = resp.StatusCode
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
@@ -286,6 +302,8 @@ func (c *Client) Read(path string) ([]byte, error) {
 
 // ReadCtx downloads a file's content with context support.
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
+	start := time.Now()
+	statusCode := 0
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
 	if err != nil {
 		return nil, err
@@ -295,10 +313,20 @@ func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	statusCode = resp.StatusCode
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	logger.InfoBenchTiming(ctx, "bench_trace_client",
+		zap.String("op", "read"),
+		zap.String("method", http.MethodGet),
+		zap.String("path", path),
+		zap.Int("bytes", len(data)),
+		zap.Int("status_code", statusCode),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
+	return data, err
 }
 
 // List returns the entries in a directory.
@@ -344,6 +372,17 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 // StatCtx is the context-aware form of the lightweight HEAD-based Stat
 // interface. Use StatMetadataCompatCtx when enriched metadata is required.
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
+	start := time.Now()
+	statusCode := 0
+	defer func() {
+		logger.InfoBenchTiming(ctx, "bench_trace_client",
+			zap.String("op", "stat"),
+			zap.String("method", http.MethodHead),
+			zap.String("path", path),
+			zap.Int("status_code", statusCode),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.url(path), nil)
 	if err != nil {
 		return nil, err
@@ -353,6 +392,7 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	statusCode = resp.StatusCode
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}

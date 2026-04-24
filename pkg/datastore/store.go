@@ -733,18 +733,31 @@ func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err e
 	start := time.Now()
 	defer observeStoreOp(ctx, "stat", start, &err)
 
+	getNodeStart := time.Now()
 	node, err := s.GetNode(ctx, path)
+	getNodeMs := float64(time.Since(getNodeStart).Microseconds()) / 1000.0
 	if err != nil {
 		return nil, err
 	}
 	nf := &NodeWithFile{Node: *node}
+	getFileMs := 0.0
 	if !node.IsDirectory && node.FileID != "" {
+		getFileStart := time.Now()
 		f, err := s.GetFile(ctx, node.FileID)
+		getFileMs = float64(time.Since(getFileStart).Microseconds()) / 1000.0
 		if err != nil {
 			return nil, err
 		}
 		nf.File = f
 	}
+	logger.InfoBenchTiming(ctx, "bench_trace_store",
+		zap.String("op", "stat"),
+		zap.String("path", path),
+		zap.Bool("is_dir", node.IsDirectory),
+		zap.Float64("get_node_ms", getNodeMs),
+		zap.Float64("get_file_ms", getFileMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	out = nf
 	return out, nil
 }
@@ -763,6 +776,12 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
 	out, err = scanNodeWithFileWithBlob(row)
+	logger.InfoBenchTiming(ctx, "bench_trace_store",
+		zap.String("op", "stat_path_fallback"),
+		zap.String("primary_path", primaryPath),
+		zap.String("fallback_path", fallbackPath),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	return out, err
 }
 
@@ -780,12 +799,15 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		LEFT JOIN files f ON fn.file_id = f.file_id AND f.status = 'CONFIRMED'
 		WHERE fn.parent_path = ?
 		ORDER BY fn.name`
+	queryStart := time.Now()
 	rows, err := s.db.QueryContext(ctx, q, parentPath)
+	queryMs := float64(time.Since(queryStart).Microseconds()) / 1000.0
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
+	scanStart := time.Now()
 	result := make([]*NodeWithFile, 0)
 	for rows.Next() {
 		nf, err := scanNodeWithFileWithBlob(rows)
@@ -797,6 +819,15 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	scanMs := float64(time.Since(scanStart).Microseconds()) / 1000.0
+	logger.InfoBenchTiming(ctx, "bench_trace_store",
+		zap.String("op", "list_dir"),
+		zap.String("parent_path", parentPath),
+		zap.Int("entries", len(result)),
+		zap.Float64("query_ms", queryMs),
+		zap.Float64("scan_ms", scanMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	out = result
 	return out, nil
 }

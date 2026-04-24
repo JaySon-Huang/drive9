@@ -18,7 +18,9 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"go.uber.org/zap"
 )
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
@@ -762,6 +764,7 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
+	start := time.Now()
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -781,6 +784,12 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				return gofuse.EIO
 			}
 			fs.fillEntryOut(entry, out)
+			logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+				zap.String("op", "lookup"),
+				zap.String("path", childP),
+				zap.String("source", "pending_index"),
+				zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+			)
 			return gofuse.OK
 		}
 	} else if fs.writeBack != nil {
@@ -795,11 +804,19 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				return gofuse.EIO
 			}
 			fs.fillEntryOut(entry, out)
+			logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+				zap.String("op", "lookup"),
+				zap.String("path", childP),
+				zap.String("source", "writeback_meta"),
+				zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+			)
 			return gofuse.OK
 		}
 	}
 
+	statStart := time.Now()
 	stat, err := fs.lookupStatWithRetry(cancel, childP)
+	statMs := float64(time.Since(statStart).Microseconds()) / 1000.0
 	if err != nil {
 		if !isNotFoundErr(err) {
 			return httpToFuseStatus(err)
@@ -811,7 +828,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if !ok {
 			return gofuse.ENOENT
 		}
+		listStart := time.Now()
 		items, listErr := fs.lookupListWithRetry(cancel, parentPath)
+		listMs := float64(time.Since(listStart).Microseconds()) / 1000.0
 		if listErr != nil {
 			return httpToFuseStatus(listErr)
 		}
@@ -828,9 +847,17 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			if !ok {
 				return gofuse.EIO
 			}
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
-		}
+				fs.fillEntryOut(entry, out)
+				logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+					zap.String("op", "lookup"),
+					zap.String("path", childP),
+					zap.String("source", "list_fallback"),
+					zap.Float64("stat_ms", statMs),
+					zap.Float64("list_ms", listMs),
+					zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+				)
+				return gofuse.OK
+			}
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
 		out.NodeId = 0
@@ -852,6 +879,13 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return gofuse.EIO
 	}
 	fs.fillEntryOut(entry, out)
+	logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+		zap.String("op", "lookup"),
+		zap.String("path", childP),
+		zap.String("source", "remote_stat"),
+		zap.Float64("stat_ms", statMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	return gofuse.OK
 }
 
@@ -860,14 +894,18 @@ func (fs *Dat9FS) Forget(nodeId uint64, nlookup uint64) {
 }
 
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) gofuse.Status {
+	start := time.Now()
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
 	}
 
 	// Prefer unflushed writable state over the remote object size.
+	statMs := 0.0
+	source := "inode_cache"
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
 		entry.Size = size
+		source = "dirty_handle"
 	} else if fs.writeBack != nil && !entry.IsDir {
 		// Check pending index first (in-memory, O(1)), then fall back
 		// to old GetMeta for backward compatibility.
@@ -879,6 +917,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
+				source = "pending_index"
 			}
 		}
 		if !pendingFound {
@@ -888,13 +927,17 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
+				source = "writeback_meta"
 			}
 		}
 		if !pendingFound && input.NodeId != 1 {
+			statStart := time.Now()
 			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+			statMs = float64(time.Since(statStart).Microseconds()) / 1000.0
 			if err != nil {
 				return httpToFuseStatus(err)
 			}
+			source = "remote_stat"
 			entry.Size = stat.Size
 			entry.IsDir = stat.IsDir
 			fs.inodes.UpdateSize(input.NodeId, stat.Size)
@@ -910,10 +953,13 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		// Some deployments do not support HEAD/stat on directories.
 		// Keep directory attrs from inode map and only refresh regular files.
 		if !entry.IsDir {
+			statStart := time.Now()
 			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+			statMs = float64(time.Since(statStart).Microseconds()) / 1000.0
 			if err != nil {
 				return httpToFuseStatus(err)
 			}
+			source = "remote_stat"
 			entry.Size = stat.Size
 			entry.IsDir = stat.IsDir
 			fs.inodes.UpdateSize(input.NodeId, stat.Size)
@@ -929,6 +975,13 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 
 	fs.fillAttr(entry, &out.Attr)
 	out.SetTimeout(fs.opts.AttrTTL)
+	logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+		zap.String("op", "getattr"),
+		zap.String("path", entry.Path),
+		zap.String("source", source),
+		zap.Float64("stat_ms", statMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	return gofuse.OK
 }
 
@@ -1722,6 +1775,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 }
 
 func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gofuse.ReadResult, gofuse.Status) {
+	start := time.Now()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return nil, gofuse.ENOENT
@@ -1841,6 +1895,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			buf := make([]byte, end-offset)
 			n, err := fs.shadowStore.ReadAt(fh.Path, offset, buf)
 			if err == nil && n > 0 {
+				logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+					zap.String("op", "read"),
+					zap.String("path", fh.Path),
+					zap.String("source", "shadow_store"),
+					zap.Int("bytes", n),
+					zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+				)
 				return gofuse.ReadResultData(buf[:n]), gofuse.OK
 			}
 		}
@@ -1858,6 +1919,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			if end > int64(len(wbData)) {
 				end = int64(len(wbData))
 			}
+			logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+				zap.String("op", "read"),
+				zap.String("path", fh.Path),
+				zap.String("source", "writeback_cache"),
+				zap.Int64("bytes", end-offset),
+				zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+			)
 			return gofuse.ReadResultData(wbData[offset:end]), gofuse.OK
 		}
 	}
@@ -1898,12 +1966,21 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			if end > int64(len(data)) {
 				end = int64(len(data))
 			}
+			logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+				zap.String("op", "read"),
+				zap.String("path", p),
+				zap.String("source", "read_cache_hit"),
+				zap.Int64("bytes", end-offset),
+				zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+			)
 			return gofuse.ReadResultData(data[offset:end]), gofuse.OK
 		}
 
 		// Cache miss: read the file and store it. No separate Stat needed —
 		// ReadCtx fetches the data in one round-trip.
+		remoteStart := time.Now()
 		data, err := fs.client.ReadCtx(ctx, p)
+		remoteMs := float64(time.Since(remoteStart).Microseconds()) / 1000.0
 		if err != nil {
 			return nil, httpToFuseStatus(err)
 		}
@@ -1917,6 +1994,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if end > int64(len(data)) {
 			end = int64(len(data))
 		}
+		logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+			zap.String("op", "read"),
+			zap.String("path", p),
+			zap.String("source", "client_read_full"),
+			zap.Int64("bytes", end-offset),
+			zap.Float64("remote_ms", remoteMs),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
 		return gofuse.ReadResultData(data[offset:end]), gofuse.OK
 	}
 
@@ -1969,6 +2054,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 }
 
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status {
+	start := time.Now()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
@@ -1989,6 +2075,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 	if fs.writeBack != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		// Same generation already cached — no new writes since last Flush.
 		if fh.WriteBackSeq > 0 && fh.WriteBackSeq == fh.DirtySeq {
+			logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+				zap.String("op", "flush"),
+				zap.String("path", fh.Path),
+				zap.String("mode", "writeback_cached_snapshot"),
+				zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+			)
 			return gofuse.OK
 		}
 		size := fh.Dirty.Size()
@@ -2009,6 +2101,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 							log.Printf("writeback snapshot failed for %s: %v", fh.Path, err)
 						}
 						fh.WriteBackSeq = fh.DirtySeq
+						logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+							zap.String("op", "flush"),
+							zap.String("path", fh.Path),
+							zap.String("mode", "writeback_shadow_fast_path"),
+							zap.Int64("size", size),
+							zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+						)
 						return gofuse.OK
 					}
 				}
@@ -2022,6 +2121,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 					// Snapshot the dirty sequence at cache-write time so
 					// Release can detect whether new writes happened since.
 					fh.WriteBackSeq = fh.DirtySeq
+					logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+						zap.String("op", "flush"),
+						zap.String("path", fh.Path),
+						zap.String("mode", "writeback_snapshot_fast_path"),
+						zap.Int64("size", size),
+						zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+					)
 					return gofuse.OK
 				}
 			}
@@ -2031,7 +2137,15 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
-	return fs.flushHandleDebounced(ctx, fh, false)
+	st := fs.flushHandleDebounced(ctx, fh, false)
+	logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+		zap.String("op", "flush"),
+		zap.String("path", fh.Path),
+		zap.String("mode", "sync_or_debounced_flush"),
+		zap.Int("status", int(st)),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
+	return st
 }
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {
@@ -2096,6 +2210,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 }
 
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
+	start := time.Now()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
 		// Cancel any pending debounce for this path — Release always flushes immediately.
@@ -2109,6 +2224,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.Lock()
 			canUseCache := fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
 			if canUseCache {
+				path := fh.Path
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 				fh.DirtySeq = 0
@@ -2154,6 +2270,12 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					fh.Prefetch.Close()
 				}
 				fs.fileHandles.Delete(input.Fh)
+				logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+					zap.String("op", "release"),
+					zap.String("path", path),
+					zap.String("mode", "async_writeback_upload"),
+					zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+				)
 				return
 			}
 			// Stale cache — remove it, fall through to sync upload.
@@ -2170,7 +2292,10 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		defer cf()
 
 		fh.Lock()
+		path := fh.Path
+		flushStart := time.Now()
 		st := fs.flushHandle(ctx, fh)
+		flushMs := float64(time.Since(flushStart).Microseconds()) / 1000.0
 		streamer := fh.Streamer
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
@@ -2188,6 +2313,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		if fh.Prefetch != nil {
 			fh.Prefetch.Close()
 		}
+		logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+			zap.String("op", "release"),
+			zap.String("path", path),
+			zap.String("mode", "sync_flush"),
+			zap.Int("status", int(st)),
+			zap.Float64("flush_ms", flushMs),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
 	}
 	fs.fileHandles.Delete(input.Fh)
 }
@@ -2257,6 +2390,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 // (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
 // callbacks. The lock is re-acquired before modifying handle state.
 func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
+	start := time.Now()
 	if fh.Dirty == nil {
 		return gofuse.OK
 	}
@@ -2272,6 +2406,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	// This path is used for large sequential writes (cp, dd, ffmpeg).
 	// Only the final partial part and any dirty (back-written) parts need uploading.
 	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+		mode := "stream_finish"
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		partSize := fh.Dirty.PartSize()
 		numParts := int((size + partSize - 1) / partSize)
@@ -2320,12 +2455,20 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
+		logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+			zap.String("op", "flush_handle"),
+			zap.String("path", fh.Path),
+			zap.String("mode", mode),
+			zap.Int64("size", size),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
 		return gofuse.OK
 	}
 
 	// Path 1b: Large new file with streaming uploader but no streaming parts
 	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= smallFileThreshold {
+		mode := "stream_upload_all"
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
 		partSnapshots := make(map[int][]byte, numParts)
@@ -2360,6 +2503,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
+		logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+			zap.String("op", "flush_handle"),
+			zap.String("path", fh.Path),
+			zap.String("mode", mode),
+			zap.Int64("size", size),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
 		return gofuse.OK
 	}
 
@@ -2367,10 +2517,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	data := fh.Dirty.Bytes()
 	expectedRevision := expectedRevisionForHandle(fh)
 
+	mode := "small_direct_put"
 	if size < smallFileThreshold {
 		// Small file: direct PUT.
 		err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevision)
 	} else if fh.OrigSize >= smallFileThreshold {
+		mode = "patch_existing_large"
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
 			partSnapshots := make(map[int][]byte, len(dirtyParts))
@@ -2400,6 +2552,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		}
 		// If no dirty parts, nothing changed — skip upload.
 	} else {
+		mode = "multipart_new_large"
 		// New large file or small-to-large growth: full upload via multipart.
 		err = fs.client.WriteStreamConditional(
 			ctx,
@@ -2426,6 +2579,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	fs.notifyInode(fh.Ino)
 	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 	fs.notifyInode(parentIno)
+	logger.InfoBenchTiming(context.Background(), "bench_trace_fuse",
+		zap.String("op", "flush_handle"),
+		zap.String("path", fh.Path),
+		zap.String("mode", mode),
+		zap.Int64("size", size),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	return gofuse.OK
 }
 

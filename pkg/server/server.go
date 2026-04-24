@@ -467,6 +467,7 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string) {
+	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_missing_scope", "path", path)...)
@@ -475,16 +476,26 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	if b.S3() != nil {
+		presignStart := time.Now()
 		url, err := b.PresignGetObject(r.Context(), path)
 		if err == nil {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
+			logger.InfoBenchTiming(r.Context(), "bench_trace_server",
+				zap.String("op", "read"),
+				zap.String("path", path),
+				zap.String("served_via", "presigned_redirect"),
+				zap.Float64("backend_ms", float64(time.Since(presignStart).Microseconds())/1000.0),
+				zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+			)
 			metricEvent(r.Context(), "fs_read", "result", "ok")
 			http.Redirect(w, r, url, http.StatusFound)
 			return
 		}
 	}
 
+	backendStart := time.Now()
 	data, err := b.ReadCtx(r.Context(), path, 0, -1)
+	backendMs := float64(time.Since(backendStart).Microseconds()) / 1000.0
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_not_found", "path", path)...)
@@ -498,6 +509,14 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(data))...)
+	logger.InfoBenchTiming(r.Context(), "bench_trace_server",
+		zap.String("op", "read"),
+		zap.String("path", path),
+		zap.String("served_via", "backend_inline_read"),
+		zap.Int("bytes", len(data)),
+		zap.Float64("backend_ms", backendMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	metricEvent(r.Context(), "fs_read", "result", "ok")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
@@ -615,6 +634,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
+	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_scope", "path", path)...)
@@ -723,7 +743,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	readBodyStart := time.Now()
 	data, err := io.ReadAll(body)
+	readBodyMs := float64(time.Since(readBodyStart).Microseconds()) / 1000.0
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -737,7 +759,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
+	backendStart := time.Now()
 	_, err = b.WriteCtxIfRevisionWithTags(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags)
+	backendMs := float64(time.Since(backendStart).Microseconds()) / 1000.0
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
@@ -763,6 +787,16 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
+	logger.InfoBenchTiming(r.Context(), "bench_trace_server",
+		zap.String("op", "write"),
+		zap.String("path", path),
+		zap.String("mode", "direct_put"),
+		zap.Int("bytes", len(data)),
+		zap.Int64("expected_revision", expectedRevision),
+		zap.Float64("read_body_ms", readBodyMs),
+		zap.Float64("backend_ms", backendMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
 	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -951,13 +985,16 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
+	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_missing_scope", "path", path)...)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+	backendStart := time.Now()
 	nf, err := b.StatNodeCtx(r.Context(), path)
+	backendMs := float64(time.Since(backendStart).Microseconds()) / 1000.0
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_not_found", "path", path)...)
@@ -985,6 +1022,13 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.Node.CreatedAt.Unix(), 10))
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
+	logger.InfoBenchTiming(r.Context(), "bench_trace_server",
+		zap.String("op", "stat"),
+		zap.String("path", path),
+		zap.Bool("is_dir", nf.Node.IsDirectory),
+		zap.Float64("backend_ms", backendMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	w.WriteHeader(http.StatusOK)
 }
 

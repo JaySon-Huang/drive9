@@ -342,7 +342,9 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 		return 0, err
 	}
 
+	statStart := time.Now()
 	existing, err := b.store.Stat(ctx, path)
+	initialStatMs := float64(time.Since(statStart).Microseconds()) / 1000.0
 	if err == datastore.ErrNotFound {
 		if expectedRevision > 0 {
 			return 0, datastore.ErrRevisionConflict
@@ -353,7 +355,18 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 			}
 			return 0, datastore.ErrNotFound
 		}
+		createStart := time.Now()
 		n, err := b.createAndWriteCtx(ctx, path, data, tags)
+		logger.InfoBenchTiming(ctx, "bench_trace_backend",
+			zap.String("op", "write"),
+			zap.String("path", path),
+			zap.Int("bytes", len(data)),
+			zap.Int64("expected_revision", expectedRevision),
+			zap.String("mode", "create"),
+			zap.Float64("initial_stat_ms", initialStatMs),
+			zap.Float64("write_impl_ms", float64(time.Since(createStart).Microseconds())/1000.0),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
 			return 0, datastore.ErrRevisionConflict
 		}
@@ -374,7 +387,19 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
 		return 0, datastore.ErrRevisionConflict
 	}
-	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags)
+	overwriteStart := time.Now()
+	n, err = b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags)
+	logger.InfoBenchTiming(ctx, "bench_trace_backend",
+		zap.String("op", "write"),
+		zap.String("path", path),
+		zap.Int("bytes", len(data)),
+		zap.Int64("expected_revision", expectedRevision),
+		zap.String("mode", "overwrite"),
+		zap.Float64("initial_stat_ms", initialStatMs),
+		zap.Float64("write_impl_ms", float64(time.Since(overwriteStart).Microseconds())/1000.0),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
+	return n, err
 }
 
 func cloneFileTags(tags map[string]string) map[string]string {
@@ -392,16 +417,25 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return 0, err
 	}
+	start := time.Now()
 	fileID := b.genID()
 	now := time.Now()
 
+	detectStart := time.Now()
 	contentType := detectContentType(path, data)
+	detectMs := float64(time.Since(detectStart).Microseconds()) / 1000.0
+	checksumStart := time.Now()
 	checksum := sha256sum(data)
+	checksumMs := float64(time.Since(checksumStart).Microseconds()) / 1000.0
+	extractStart := time.Now()
 	contentText := extractText(data, contentType)
+	extractMs := float64(time.Since(extractStart).Microseconds()) / 1000.0
 
 	storageType := datastore.StorageDB9
 	storageRef := "inline"
 	var contentBlob []byte
+	putObjectMs := 0.0
+	storageMode := "db_inline"
 	if b.shouldStoreInDB(int64(len(data))) {
 		contentBlob = append([]byte(nil), data...)
 	} else {
@@ -410,16 +444,30 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
+		storageMode = "s3"
+		putStart := time.Now()
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data))); err != nil {
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
 		}
+		putObjectMs = float64(time.Since(putStart).Microseconds()) / 1000.0
 	}
 
+	txStart := time.Now()
+	quotaMs := 0.0
+	insertFileMs := 0.0
+	ensureParentDirsMs := 0.0
+	insertNodeMs := 0.0
+	replaceTagsMs := 0.0
+	semanticEnqueueMs := 0.0
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		quotaStart := time.Now()
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
 			return err
 		}
+		quotaMs = float64(time.Since(quotaStart).Microseconds()) / 1000.0
+
+		insertFileStart := time.Now()
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 			ContentBlob: contentBlob,
@@ -429,25 +477,40 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}); err != nil {
 			return err
 		}
+		insertFileMs = float64(time.Since(insertFileStart).Microseconds()) / 1000.0
+
+		ensureParentDirsStart := time.Now()
 		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
 			return err
 		}
+		ensureParentDirsMs = float64(time.Since(ensureParentDirsStart).Microseconds()) / 1000.0
+
+		insertNodeStart := time.Now()
 		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 		}); err != nil {
 			return err
 		}
+		insertNodeMs = float64(time.Since(insertNodeStart).Microseconds()) / 1000.0
 		if tags != nil {
+			replaceTagsStart := time.Now()
 			if err := b.store.ReplaceFileTagsTx(tx, fileID, tags); err != nil {
 				return err
 			}
+			replaceTagsMs = float64(time.Since(replaceTagsStart).Microseconds()) / 1000.0
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			semanticEnqueueStart := time.Now()
+			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			semanticEnqueueMs = float64(time.Since(semanticEnqueueStart).Microseconds()) / 1000.0
+			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
-			return b.enqueueEmbedTaskTx(tx, fileID, 1)
+			semanticEnqueueStart := time.Now()
+			err := b.enqueueEmbedTaskTx(tx, fileID, 1)
+			semanticEnqueueMs = float64(time.Since(semanticEnqueueStart).Microseconds()) / 1000.0
+			return err
 		}
 		return nil
 	}); err != nil {
@@ -456,6 +519,26 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		return 0, err
 	}
+	txMs := float64(time.Since(txStart).Microseconds()) / 1000.0
+	logger.InfoBenchTiming(ctx, "bench_trace_backend",
+		zap.String("op", "create_and_write"),
+		zap.String("path", path),
+		zap.Int("bytes", len(data)),
+		zap.String("storage_mode", storageMode),
+		zap.String("storage_type", string(storageType)),
+		zap.Float64("detect_content_type_ms", detectMs),
+		zap.Float64("checksum_ms", checksumMs),
+		zap.Float64("extract_text_ms", extractMs),
+		zap.Float64("put_object_ms", putObjectMs),
+		zap.Float64("quota_ms", quotaMs),
+		zap.Float64("insert_file_ms", insertFileMs),
+		zap.Float64("ensure_parent_dirs_ms", ensureParentDirsMs),
+		zap.Float64("insert_node_ms", insertNodeMs),
+		zap.Float64("replace_tags_ms", replaceTagsMs),
+		zap.Float64("semantic_enqueue_ms", semanticEnqueueMs),
+		zap.Float64("tx_ms", txMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
@@ -472,10 +555,14 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	if nf.File == nil {
 		return 0, fmt.Errorf("no file entity")
 	}
+	start := time.Now()
 
 	var finalData []byte
+	readExistingMs := 0.0
 	if flags&filesystem.WriteFlagAppend != 0 {
+		readStart := time.Now()
 		existing, err := b.readFileDataCtx(ctx, nf.File)
+		readExistingMs = float64(time.Since(readStart).Microseconds()) / 1000.0
 		if err != nil {
 			return 0, fmt.Errorf("read existing data for append: %w", err)
 		}
@@ -483,7 +570,9 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
 		finalData = data
 	} else {
+		readStart := time.Now()
 		existing, err := b.readFileDataCtx(ctx, nf.File)
+		readExistingMs = float64(time.Since(readStart).Microseconds()) / 1000.0
 		if err != nil {
 			return 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
@@ -500,12 +589,20 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
 		return 0, err
 	}
+	detectStart := time.Now()
 	contentType := detectContentType(nf.Node.Path, finalData)
+	detectMs := float64(time.Since(detectStart).Microseconds()) / 1000.0
+	checksumStart := time.Now()
 	checksum := sha256sum(finalData)
+	checksumMs := float64(time.Since(checksumStart).Microseconds()) / 1000.0
+	extractStart := time.Now()
 	contentText := extractText(finalData, contentType)
+	extractMs := float64(time.Since(extractStart).Microseconds()) / 1000.0
 	storageType := datastore.StorageDB9
 	storageRef := "inline"
 	var contentBlob []byte
+	putObjectMs := 0.0
+	storageMode := "db_inline"
 	if b.shouldStoreInDB(int64(len(finalData))) {
 		contentBlob = append([]byte(nil), finalData...)
 	} else {
@@ -514,18 +611,29 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + b.genID()
+		storageMode = "s3"
+		putStart := time.Now()
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
 			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
 		}
+		putObjectMs = float64(time.Since(putStart).Microseconds()) / 1000.0
 	}
 
 	var newRev int64
+	txStart := time.Now()
+	quotaMs := 0.0
+	updateFileMs := 0.0
+	replaceTagsMs := 0.0
+	semanticEnqueueMs := 0.0
 	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		quotaStart := time.Now()
 		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
+		quotaMs = float64(time.Since(quotaStart).Microseconds()) / 1000.0
 		var txErr error
+		updateFileStart := time.Now()
 		if b.UsesDatabaseAutoEmbedding() {
 			if expectedRevision > 0 {
 				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
@@ -554,16 +662,25 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		if txErr != nil {
 			return txErr
 		}
+		updateFileMs = float64(time.Since(updateFileStart).Microseconds()) / 1000.0
 		if tags != nil {
+			replaceTagsStart := time.Now()
 			if err := b.store.ReplaceFileTagsTx(tx, nf.File.FileID, tags); err != nil {
 				return err
 			}
+			replaceTagsMs = float64(time.Since(replaceTagsStart).Microseconds()) / 1000.0
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			semanticEnqueueStart := time.Now()
+			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			semanticEnqueueMs = float64(time.Since(semanticEnqueueStart).Microseconds()) / 1000.0
+			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
-			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+			semanticEnqueueStart := time.Now()
+			err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+			semanticEnqueueMs = float64(time.Since(semanticEnqueueStart).Microseconds()) / 1000.0
+			return err
 		}
 		return nil
 	})
@@ -573,6 +690,25 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 		return 0, err
 	}
+	txMs := float64(time.Since(txStart).Microseconds()) / 1000.0
+	logger.InfoBenchTiming(ctx, "bench_trace_backend",
+		zap.String("op", "overwrite_file"),
+		zap.String("path", nf.Node.Path),
+		zap.Int("bytes", len(data)),
+		zap.Int64("final_bytes", int64(len(finalData))),
+		zap.String("storage_mode", storageMode),
+		zap.Float64("read_existing_ms", readExistingMs),
+		zap.Float64("detect_content_type_ms", detectMs),
+		zap.Float64("checksum_ms", checksumMs),
+		zap.Float64("extract_text_ms", extractMs),
+		zap.Float64("put_object_ms", putObjectMs),
+		zap.Float64("quota_ms", quotaMs),
+		zap.Float64("update_file_ms", updateFileMs),
+		zap.Float64("replace_tags_ms", replaceTagsMs),
+		zap.Float64("semantic_enqueue_ms", semanticEnqueueMs),
+		zap.Float64("tx_ms", txMs),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	// Temporary compatibility: app embedding still relies on the legacy
@@ -626,16 +762,54 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 }
 
 func (b *Dat9Backend) StatNodeCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
+	start := time.Now()
 	resolvedPath := normalizePath(path)
 	if pathutil.IsDir(path) {
-		return b.store.Stat(ctx, resolvedPath)
+		nf, err := b.store.Stat(ctx, resolvedPath)
+		logger.InfoBenchTiming(ctx, "bench_trace_backend",
+			zap.String("op", "stat"),
+			zap.String("path", path),
+			zap.String("resolved_path", resolvedPath),
+			zap.Bool("used_fallback", false),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
+		return nf, err
 	}
 
 	dirPath, dirErr := pathutil.CanonicalizeDir(path)
 	if dirErr != nil || dirPath == resolvedPath {
-		return b.store.Stat(ctx, resolvedPath)
+		nf, err := b.store.Stat(ctx, resolvedPath)
+		logger.InfoBenchTiming(ctx, "bench_trace_backend",
+			zap.String("op", "stat"),
+			zap.String("path", path),
+			zap.String("resolved_path", resolvedPath),
+			zap.Bool("used_fallback", false),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
+		return nf, err
 	}
-	return b.store.StatPathFallback(ctx, resolvedPath, dirPath)
+	nf, err := b.store.Stat(ctx, resolvedPath)
+	if err == nil || !errors.Is(err, datastore.ErrNotFound) {
+		logger.InfoBenchTiming(ctx, "bench_trace_backend",
+			zap.String("op", "stat"),
+			zap.String("path", path),
+			zap.String("resolved_path", resolvedPath),
+			zap.Bool("used_fallback", false),
+			zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+		)
+		return nf, err
+	}
+
+	nf, err = b.store.StatPathFallback(ctx, resolvedPath, dirPath)
+	logger.InfoBenchTiming(ctx, "bench_trace_backend",
+		zap.String("op", "stat"),
+		zap.String("path", path),
+		zap.String("resolved_path", resolvedPath),
+		zap.String("fallback_path", dirPath),
+		zap.Bool("used_fallback", true),
+		zap.Float64("elapsed_ms", float64(time.Since(start).Microseconds())/1000.0),
+	)
+	return nf, err
 }
 
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
