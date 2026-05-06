@@ -277,3 +277,57 @@ drive9-server schema dump-init-sql --provider db9
 
 - Do not maintain a second handwritten copy of those init SQL statements when a command can
   export the exact runtime source of truth.
+
+---
+
+## Cursor Cloud specific instructions
+
+### External dependency: agfs
+
+CI clones the `agfs` repo to `../agfs` before every build. In the Cloud Agent environment this
+is handled by the update script. If `go build` fails with a missing `agfs` module, verify that
+`../agfs` exists.
+
+### Running tests
+
+- `make test` (without `DRIVE9_TEST_MYSQL_DSN`) uses Docker testcontainers to spin up MySQL 8.0.
+  Docker must be running. This is the recommended way to run tests in the Cloud Agent environment.
+- Do **not** set `DRIVE9_TEST_MYSQL_DSN` to the TiDB playground for tests — some schema-init
+  tests fail on TiDB due to index-creation dialect differences. TiDB is only for the local dev
+  server.
+
+### Running the local dev server
+
+The TiDB playground must be running on port 4000 before starting the server.
+
+```bash
+# Start TiDB (if not already running):
+export PATH="$HOME/.tiup/bin:$PATH"
+tiup playground v8.5.5 --tiflash 0 --without-monitor &
+
+# Wait for readiness, then create the database:
+mysql --protocol=tcp -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS drive9_local;"
+
+# Start the server:
+source ./scripts/drive9-server-local-env.sh
+export DRIVE9_LOCAL_INIT_SCHEMA=true
+export DRIVE9_LOCAL_EMBEDDING_MODE=app   # avoids needing Ollama
+make run-server-local
+```
+
+Health check: `curl http://127.0.0.1:9009/healthz`
+
+### CLI usage against local server
+
+```bash
+export DRIVE9_SERVER=http://127.0.0.1:9009
+export DRIVE9_API_KEY=local-dev-key
+./bin/drive9 fs cp local-file.txt :/remote/path.txt
+./bin/drive9 fs cat :/remote/path.txt
+```
+
+### Docker in Cloud Agent VMs
+
+The Cloud Agent VM runs inside a Firecracker VM / nested container. Docker requires
+`fuse-overlayfs` as storage driver and `iptables-legacy` (configured via the update script's
+system-level setup).
