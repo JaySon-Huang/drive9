@@ -10,6 +10,7 @@
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
 //	        symlink, sh, grep, find)
+//	db      database operations (sql)
 //	token  issue and revoke workspace-zone scoped filesystem tokens
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
@@ -45,6 +46,7 @@ var vaultHandler = cli.Secret
 var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
+var dbHandler = cli.SQL
 
 func main() {
 	if logger.CLIEnabled() {
@@ -157,6 +159,15 @@ func dispatch(cmd string, args []string) {
 			}
 			fatal("journal"+sub, err)
 		}
+	case "db":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "db"), zap.String("subcommand", sub))
+		}
+		runDB(args)
 	case "mount":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "mount"))
@@ -217,6 +228,28 @@ func startCPUProfileFromEnv() (func(), error) {
 			_ = f.Close()
 		})
 	}, nil
+}
+
+func runDB(args []string) {
+	if len(args) < 1 {
+		dbUsage(2)
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	var err error
+	switch sub {
+	case "sql":
+		err = dbHandler(cli.NewFromEnv(), rest)
+	case "-h", "-help", "--help", "help":
+		dbUsage(0)
+	default:
+		fmt.Fprintf(os.Stderr, "drive9 db: unknown command %q\n", sub)
+		dbUsage(2)
+	}
+	if err != nil {
+		fatal("db "+sub, err)
+	}
 }
 
 func runFS(args []string) {
@@ -306,6 +339,7 @@ func usage(code int) {
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
 			"  fs <command>           filesystem operations\n"+
+			"  db sql -q <query>      execute SQL against the current drive9 database\n"+
 			"  token <issue|revoke>   issue and revoke workspace-zone scoped tokens\n"+
 			"  vault <set|get|put|with|ls|rm|grant|revoke|audit>\n"+
 			"                         vault operations\n"+
@@ -321,6 +355,19 @@ func usage(code int) {
 			"  -h, --help, help       show this help\n"+
 			"  -v, --version, version print version information\n",
 	)
+	exitWithCode(code)
+}
+
+func dbUsage(code int) {
+	fmt.Fprintf(os.Stderr, `usage: drive9 db <command> [arguments]
+
+commands:
+  sql -q <query>      execute SQL query
+  sql -f <file>       execute SQL query from file
+
+global:
+  -h, --help, help    show this help
+`)
 	exitWithCode(code)
 }
 

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func TestVersionStringUsesDrive9Component(t *testing.T) {
@@ -82,6 +84,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
+		"db sql -q <query>",
 		"token <issue|revoke>",
 		"journal <new|append|cat|find|verify>",
 		"mount [flags] [:/remote] <mountpoint>",
@@ -186,6 +189,42 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 				t.Errorf("stderr = %q, want empty stderr for explicit help", stderr)
 			}
 		})
+	}
+}
+
+func TestDispatchDBSQLVerbReachesHandler(t *testing.T) {
+	origHandler := dbHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		dbHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	dbHandler = func(c *client.Client, args []string) error {
+		called = true
+		if c == nil {
+			t.Fatal("db handler received nil client")
+		}
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("db", []string{"sql", "-q", "SELECT 1"})
+
+	if !called {
+		t.Fatal("db handler was not invoked for `drive9 db sql ...`")
+	}
+	want := []string{"-q", "SELECT 1"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
 	}
 }
 
