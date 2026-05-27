@@ -93,7 +93,17 @@ func newTestTenantPool(t *testing.T) *tenant.Pool {
 }
 
 func newTestTenantPoolWithBackendOptions(t *testing.T, opts backend.Options) *tenant.Pool {
+	return newTestTenantPoolWithConfig(t, tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost", BackendOptions: opts})
+}
+
+func newTestTenantPoolWithConfig(t *testing.T, cfg tenant.PoolConfig) *tenant.Pool {
 	t.Helper()
+	if cfg.S3Dir == "" {
+		cfg.S3Dir = mustTempDir(t)
+	}
+	if cfg.PublicURL == "" {
+		cfg.PublicURL = "http://localhost"
+	}
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
 		t.Fatal(err)
@@ -102,9 +112,26 @@ func newTestTenantPoolWithBackendOptions(t *testing.T, opts backend.Options) *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost", BackendOptions: opts}, enc)
+	pool := tenant.NewPool(cfg, enc)
 	t.Cleanup(func() { pool.Close() })
 	return pool
+}
+
+func newTestSemanticWorkerMultiTenantPool(t *testing.T) *tenant.Pool {
+	t.Helper()
+	return newTestTenantPoolWithConfig(t, tenant.PoolConfig{
+		S3Dir:               mustTempDir(t),
+		PublicURL:           "http://localhost",
+		SkipTiDBSchemaCheck: true,
+		BackendOptions: backend.Options{
+			AsyncImageExtract: backend.AsyncImageExtractOptions{
+				Enabled:   true,
+				Workers:   1,
+				QueueSize: 4,
+				Extractor: staticServerImageExtractor{text: "caption"},
+			},
+		},
+	})
 }
 
 func newTestBackendForSemanticWorkerWithOptions(t *testing.T, opts backend.Options) *backend.Dat9Backend {
@@ -1113,6 +1140,164 @@ func TestSemanticWorkerListTenantRefsRotatesAcrossActiveTenantPages(t *testing.T
 	}
 }
 
+func TestSemanticWorkerClaimMissSkipsBacklogTenantOnSamePage(t *testing.T) {
+	// Multi-tenant semantic worker scans active tenants one page at a time and
+	// round-robins a single tenant slot per processNext call. When the picked
+	// tenant has no claimable tasks, processNext returns immediately instead of
+	// trying other tenants on the same scan page.
+	//
+	// This reproduces production starvation: a tenant with img_extract_text backlog
+	// keeps attempt_count=0 while workers repeatedly miss on empty tenants first.
+	// After fixing same-page claim retry, update this test to expect the backlog
+	// task to be claimed.
+	if testDSN == "" {
+		t.Skip("no test database available")
+	}
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	suffix := strings.ReplaceAll(token.NewID(), "-", "")[:12]
+	emptyDBName := "drive9_sw_empty_" + suffix
+	backlogDBName := "drive9_sw_backlog_" + suffix
+	emptyDSN := mustCreateTestTenantDatabase(t, testDSN, emptyDBName)
+	backlogDSN := mustCreateTestTenantDatabase(t, testDSN, backlogDBName)
+	t.Cleanup(func() {
+		dropTestTenantDatabase(t, testDSN, emptyDBName)
+		dropTestTenantDatabase(t, testDSN, backlogDBName)
+	})
+
+	pool := newTestSemanticWorkerMultiTenantPool(t)
+	pool.SetMetaStore(metaStore)
+
+	host, port := mysqlHostPortFromDSN(parsed)
+	rootPass := parsed.Passwd
+	passCipher, err := pool.Encrypt(context.Background(), []byte(rootPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	emptyTenantID := "tenant-empty-" + suffix
+	backlogTenantID := "tenant-backlog-" + suffix
+	insertSemanticWorkerTestTenant := func(id, dbName string, createdAt time.Time) {
+		t.Helper()
+		if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+			ID:               id,
+			Status:           meta.TenantActive,
+			DBHost:           host,
+			DBPort:           port,
+			DBUser:           "root",
+			DBPasswordCipher: passCipher,
+			DBName:           dbName,
+			DBTLS:            false,
+			Provider:         tenant.ProviderTiDBZero,
+			SchemaVersion:    1,
+			CreatedAt:        createdAt,
+			UpdatedAt:        createdAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertSemanticWorkerTestTenant(emptyTenantID, emptyDBName, base)
+	insertSemanticWorkerTestTenant(backlogTenantID, backlogDBName, base.Add(time.Second))
+
+	// Backlog tenant has a queued img_extract_text task; empty tenant has none.
+	backlogStore, err := datastore.Open(backlogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = backlogStore.Close() }()
+	const backlogTaskID = "backlog-img-task"
+	if _, err := backlogStore.EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          backlogTaskID,
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      "backlog-image-file",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base,
+		CreatedAt:       base,
+		UpdatedAt:       base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
+		return provider == tenant.ProviderTiDBZero
+	}
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, nil, SemanticWorkerOptions{
+		TenantScanLimit: 8,
+		LeaseDuration:   time.Second,
+	})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	m.rr = 0
+
+	ctx := context.Background()
+	// Both tenants fit on one scan page; empty tenant sorts first by created_at.
+	refs, err := m.listTenantRefs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("tenant ref count=%d, want 2 on same scan page", len(refs))
+	}
+	if refs[0].id != emptyTenantID {
+		t.Fatalf("first tenant ref id=%q, want empty tenant %q", refs[0].id, emptyTenantID)
+	}
+	if refs[1].id != backlogTenantID {
+		t.Fatalf("second tenant ref id=%q, want backlog tenant %q", refs[1].id, backlogTenantID)
+	}
+
+	// rr=0 picks the empty tenant; claim miss ends the round without trying backlog.
+	if processed := m.processNext(ctx); processed {
+		t.Fatal("expected processNext to miss when round-robin picks an empty tenant first")
+	}
+
+	var task serverSemanticTaskState
+	if err := backlogStore.DB().QueryRow(`SELECT task_id, task_type, resource_id, status, attempt_count, COALESCE(last_error, '')
+		FROM semantic_tasks WHERE task_id = ?`, backlogTaskID).Scan(
+		&task.TaskID,
+		&task.TaskType,
+		&task.ResourceID,
+		&task.Status,
+		&task.AttemptCount,
+		&task.LastError,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != string(semantic.TaskQueued) || task.AttemptCount != 0 {
+		t.Fatalf("backlog task=%+v, want queued with attempt_count 0 after claim miss on empty tenant", task)
+	}
+
+	emptyStore, err := datastore.Open(emptyDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = emptyStore.Close() }()
+	var emptyTaskCount int
+	if err := emptyStore.DB().QueryRow(`SELECT COUNT(*) FROM semantic_tasks WHERE status = ?`, string(semantic.TaskQueued)).Scan(&emptyTaskCount); err != nil {
+		t.Fatal(err)
+	}
+	if emptyTaskCount != 0 {
+		t.Fatalf("empty tenant queued tasks=%d, want 0", emptyTaskCount)
+	}
+}
+
 func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1706,6 +1891,70 @@ func mustGetServerSemanticTask(t *testing.T, b *backend.Dat9Backend, taskID stri
 		t.Fatalf("get semantic task %s: %v", taskID, err)
 	}
 	return task
+}
+
+func mysqlHostPortFromDSN(parsed *mysql.Config) (host string, port int) {
+	host, port = "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	return host, port
+}
+
+func mysqlRootDSN(baseDSN, dbName string) (string, error) {
+	parsed, err := mysql.ParseDSN(baseDSN)
+	if err != nil {
+		return "", err
+	}
+	host, port := mysqlHostPortFromDSN(parsed)
+	if dbName == "" {
+		return fmt.Sprintf("root:%s@tcp(%s:%d)/?parseTime=true", parsed.Passwd, host, port), nil
+	}
+	return fmt.Sprintf("root:%s@tcp(%s:%d)/%s?parseTime=true", parsed.Passwd, host, port, dbName), nil
+}
+
+func mustCreateTestTenantDatabase(t *testing.T, baseDSN, dbName string) string {
+	t.Helper()
+	adminDSN, err := mysqlRootDSN(baseDSN, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminDB, err := sql.Open("mysql", adminDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adminDB.Close() }()
+	if _, err := adminDB.Exec("CREATE DATABASE IF NOT EXISTS `" + dbName + "`"); err != nil {
+		t.Fatal(err)
+	}
+	tenantDSN, err := mysqlRootDSN(baseDSN, dbName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initServerTenantSchema(t, tenantDSN)
+	return tenantDSN
+}
+
+func dropTestTenantDatabase(t *testing.T, baseDSN, dbName string) {
+	t.Helper()
+	adminDSN, err := mysqlRootDSN(baseDSN, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminDB, err := sql.Open("mysql", adminDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adminDB.Close() }()
+	if _, err := adminDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastore.File {
