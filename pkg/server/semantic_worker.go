@@ -182,6 +182,41 @@ type semanticTenantScanSnapshot struct {
 	wrapped         bool
 }
 
+type semanticWorkerClaimResult string
+
+const (
+	semanticWorkerClaimMiss  semanticWorkerClaimResult = "miss"
+	semanticWorkerClaimError semanticWorkerClaimResult = "error"
+	semanticWorkerClaimOk    semanticWorkerClaimResult = "ok"
+)
+
+type semanticWorkerClaimRoundStats struct {
+	tenantsChecked int
+	misses         int
+	errors         int
+	ok             int
+}
+
+func (s *semanticWorkerClaimRoundStats) record(result semanticWorkerClaimResult) {
+	s.tenantsChecked++
+	switch result {
+	case semanticWorkerClaimMiss:
+		s.misses++
+	case semanticWorkerClaimError:
+		s.errors++
+	case semanticWorkerClaimOk:
+		s.ok++
+	}
+}
+
+func (s semanticWorkerClaimRoundStats) claimed() bool {
+	return s.ok > 0
+}
+
+func (s semanticWorkerClaimRoundStats) shouldLogRound() bool {
+	return s.tenantsChecked > 0 && (s.misses > 0 || s.errors > 0)
+}
+
 type semanticTaskAction string
 
 const (
@@ -341,14 +376,52 @@ func (m *semanticWorkerManager) recoverLoop(ctx context.Context) {
 }
 
 func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
-	target, err := m.nextTarget(ctx)
+	refs, err := m.listTenantRefs(ctx)
 	if err != nil {
 		logger.Warn(ctx, "semantic_worker_pick_tenant_failed", zap.Error(err))
 		return false
 	}
-	if target == nil {
+	if len(refs) == 0 {
 		return false
 	}
+
+	var round semanticWorkerClaimRoundStats
+	logClaimRound := func() {
+		if !round.shouldLogRound() {
+			return
+		}
+		logger.Info(ctx, "semantic_worker_claim_round",
+			zap.Int("tenants_checked", round.tenantsChecked),
+			zap.Int("claim_misses", round.misses),
+			zap.Int("claim_errors", round.errors),
+			zap.Int("claim_ok", round.ok),
+			zap.Bool("claimed", round.claimed()))
+	}
+	for range len(refs) {
+		target, err := m.nextTargetFromRefs(ctx, refs)
+		if err != nil {
+			logger.Warn(ctx, "semantic_worker_pick_tenant_failed", zap.Error(err))
+			return false
+		}
+		if target == nil {
+			break
+		}
+		result := m.processNextTarget(ctx, target)
+		round.record(result)
+		if result == semanticWorkerClaimOk {
+			logClaimRound()
+			return true
+		}
+	}
+	logClaimRound()
+	return false
+}
+
+// processNextTarget claims one semantic task for target and dispatches it when found.
+// It always releases target on return. The result reports the claim outcome:
+// miss when the tenant queue is empty, error on claim failure, or ok after the
+// claimed task is processed.
+func (m *semanticWorkerManager) processNextTarget(ctx context.Context, target *semanticTarget) semanticWorkerClaimResult {
 	defer target.release()
 
 	claimStart := time.Now()
@@ -358,24 +431,28 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 		logger.Warn(ctx, "semantic_worker_claim_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", target.tenantID),
-				zap.String("result", "error"),
+				zap.String("result", string(semanticWorkerClaimError)),
 			}, zap.Error(err))...)
 		m.invalidateTenantBackend(target.tenantID)
-		return false
+		return semanticWorkerClaimError
 	}
 	if !found {
-		return false
+		metrics.RecordOperation("semantic_worker", "claim", "miss", time.Since(claimStart))
+		logger.Debug(ctx, "semantic_worker_claim_miss",
+			zap.String("tenant_id", target.tenantID),
+			zap.String("result", string(semanticWorkerClaimMiss)))
+		return semanticWorkerClaimMiss
 	}
 	metrics.RecordOperation("semantic_worker", "claim", "ok", time.Since(claimStart))
 	logger.Info(ctx, "semantic_worker_claim_ok",
 		append([]zap.Field{
 			zap.String("tenant_id", target.tenantID),
-			zap.String("result", "ok"),
+			zap.String("result", string(semanticWorkerClaimOk)),
 		}, semanticTaskLogFields(task)...)...)
 	m.markProcessingStart()
 	defer m.markProcessingDone()
 	m.processTask(ctx, target, task)
-	return true
+	return semanticWorkerClaimOk
 }
 
 func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanticTarget, task *semantic.Task) {
@@ -556,11 +633,7 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 	}
 }
 
-func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget, error) {
-	refs, err := m.listTenantRefs(ctx)
-	if err != nil {
-		return nil, err
-	}
+func (m *semanticWorkerManager) nextTargetFromRefs(ctx context.Context, refs []semanticTenantRef) (*semanticTarget, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}

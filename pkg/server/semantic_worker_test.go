@@ -1140,16 +1140,11 @@ func TestSemanticWorkerListTenantRefsRotatesAcrossActiveTenantPages(t *testing.T
 	}
 }
 
-func TestSemanticWorkerClaimMissSkipsBacklogTenantOnSamePage(t *testing.T) {
+func TestSemanticWorkerClaimMissRetriesBacklogTenantOnSamePage(t *testing.T) {
 	// Multi-tenant semantic worker scans active tenants one page at a time and
-	// round-robins a single tenant slot per processNext call. When the picked
-	// tenant has no claimable tasks, processNext returns immediately instead of
-	// trying other tenants on the same scan page.
-	//
-	// This reproduces production starvation: a tenant with img_extract_text backlog
-	// keeps attempt_count=0 while workers repeatedly miss on empty tenants first.
-	// After fixing same-page claim retry, update this test to expect the backlog
-	// task to be claimed.
+	// round-robins a single tenant slot per processNext attempt. When the first
+	// picked tenant has no claimable tasks, processNext should keep trying other
+	// tenants on the same scan page before giving up.
 	if testDSN == "" {
 		t.Skip("no test database available")
 	}
@@ -1263,9 +1258,9 @@ func TestSemanticWorkerClaimMissSkipsBacklogTenantOnSamePage(t *testing.T) {
 		t.Fatalf("second tenant ref id=%q, want backlog tenant %q", refs[1].id, backlogTenantID)
 	}
 
-	// rr=0 picks the empty tenant; claim miss ends the round without trying backlog.
-	if processed := m.processNext(ctx); processed {
-		t.Fatal("expected processNext to miss when round-robin picks an empty tenant first")
+	// rr=0 picks the empty tenant first; same-page retry should claim backlog next.
+	if processed := m.processNext(ctx); !processed {
+		t.Fatal("expected processNext to claim backlog tenant after empty tenant miss")
 	}
 
 	var task serverSemanticTaskState
@@ -1280,8 +1275,8 @@ func TestSemanticWorkerClaimMissSkipsBacklogTenantOnSamePage(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if task.Status != string(semantic.TaskQueued) || task.AttemptCount != 0 {
-		t.Fatalf("backlog task=%+v, want queued with attempt_count 0 after claim miss on empty tenant", task)
+	if task.AttemptCount < 1 {
+		t.Fatalf("backlog task=%+v, want attempt_count >= 1 after same-page claim retry", task)
 	}
 
 	emptyStore, err := datastore.Open(emptyDSN)
