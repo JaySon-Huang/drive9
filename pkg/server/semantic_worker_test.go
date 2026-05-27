@@ -1140,6 +1140,18 @@ func TestSemanticWorkerListTenantRefsRotatesAcrossActiveTenantPages(t *testing.T
 	}
 }
 
+func TestSemanticWorkerClaimRoundStatsLogAtInfoLevel(t *testing.T) {
+	if (semanticWorkerClaimRoundStats{tenantsChecked: 3, misses: 3}).logAtInfoLevel() {
+		t.Fatal("all-miss round should log at debug")
+	}
+	if !(semanticWorkerClaimRoundStats{tenantsChecked: 2, misses: 1, ok: 1}).logAtInfoLevel() {
+		t.Fatal("claimed round should log at info")
+	}
+	if !(semanticWorkerClaimRoundStats{tenantsChecked: 1, errors: 1}).logAtInfoLevel() {
+		t.Fatal("error round should log at info")
+	}
+}
+
 func TestSemanticWorkerClaimMissRetriesBacklogTenantOnSamePage(t *testing.T) {
 	// Multi-tenant semantic worker scans active tenants one page at a time and
 	// round-robins a single tenant slot per processNext attempt. When the first
@@ -1174,8 +1186,7 @@ func TestSemanticWorkerClaimMissRetriesBacklogTenantOnSamePage(t *testing.T) {
 	pool.SetMetaStore(metaStore)
 
 	host, port := mysqlHostPortFromDSN(parsed)
-	rootPass := parsed.Passwd
-	passCipher, err := pool.Encrypt(context.Background(), []byte(rootPass))
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1189,7 +1200,7 @@ func TestSemanticWorkerClaimMissRetriesBacklogTenantOnSamePage(t *testing.T) {
 			Status:           meta.TenantActive,
 			DBHost:           host,
 			DBPort:           port,
-			DBUser:           "root",
+			DBUser:           parsed.User,
 			DBPasswordCipher: passCipher,
 			DBName:           dbName,
 			DBTLS:            false,
@@ -1902,54 +1913,84 @@ func mysqlHostPortFromDSN(parsed *mysql.Config) (host string, port int) {
 	return host, port
 }
 
-func mysqlRootDSN(baseDSN, dbName string) (string, error) {
+func mysqlDSN(user, password, host string, port int, dbName string) string {
+	if dbName == "" {
+		return fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true", user, password, host, port)
+	}
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", user, password, host, port, dbName)
+}
+
+func mysqlTenantDSN(baseDSN, dbName string) (string, *mysql.Config, error) {
 	parsed, err := mysql.ParseDSN(baseDSN)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	host, port := mysqlHostPortFromDSN(parsed)
-	if dbName == "" {
-		return fmt.Sprintf("root:%s@tcp(%s:%d)/?parseTime=true", parsed.Passwd, host, port), nil
+	return mysqlDSN(parsed.User, parsed.Passwd, host, port, dbName), parsed, nil
+}
+
+func isMySQLAccessDenied(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1044, 1045, 1227:
+			return true
+		}
 	}
-	return fmt.Sprintf("root:%s@tcp(%s:%d)/%s?parseTime=true", parsed.Passwd, host, port, dbName), nil
+	return strings.Contains(strings.ToLower(err.Error()), "access denied")
+}
+
+func execMySQLAdmin(t *testing.T, parsed *mysql.Config, query string, args ...any) {
+	t.Helper()
+	host, port := mysqlHostPortFromDSN(parsed)
+	run := func(user, password string) error {
+		adminDB, err := sql.Open("mysql", mysqlDSN(user, password, host, port, ""))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = adminDB.Close() }()
+		_, err = adminDB.Exec(query, args...)
+		return err
+	}
+	err := run(parsed.User, parsed.Passwd)
+	if err == nil {
+		return
+	}
+	if !isMySQLAccessDenied(err) || parsed.User == "root" {
+		t.Fatal(err)
+	}
+	if err := run("root", parsed.Passwd); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func grantTestTenantDatabase(t *testing.T, parsed *mysql.Config, dbName string) {
+	t.Helper()
+	if parsed.User == "" || parsed.User == "root" {
+		return
+	}
+	execMySQLAdmin(t, parsed, fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%%'", dbName, parsed.User))
 }
 
 func mustCreateTestTenantDatabase(t *testing.T, baseDSN, dbName string) string {
 	t.Helper()
-	adminDSN, err := mysqlRootDSN(baseDSN, "")
+	tenantDSN, parsed, err := mysqlTenantDSN(baseDSN, dbName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	adminDB, err := sql.Open("mysql", adminDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = adminDB.Close() }()
-	if _, err := adminDB.Exec("CREATE DATABASE IF NOT EXISTS `" + dbName + "`"); err != nil {
-		t.Fatal(err)
-	}
-	tenantDSN, err := mysqlRootDSN(baseDSN, dbName)
-	if err != nil {
-		t.Fatal(err)
-	}
+	execMySQLAdmin(t, parsed, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`")
+	grantTestTenantDatabase(t, parsed, dbName)
 	initServerTenantSchema(t, tenantDSN)
 	return tenantDSN
 }
 
 func dropTestTenantDatabase(t *testing.T, baseDSN, dbName string) {
 	t.Helper()
-	adminDSN, err := mysqlRootDSN(baseDSN, "")
+	_, parsed, err := mysqlTenantDSN(baseDSN, dbName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	adminDB, err := sql.Open("mysql", adminDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = adminDB.Close() }()
-	if _, err := adminDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
-		t.Fatal(err)
-	}
+	execMySQLAdmin(t, parsed, "DROP DATABASE IF EXISTS `"+dbName+"`")
 }
 
 func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastore.File {

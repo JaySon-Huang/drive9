@@ -217,6 +217,28 @@ func (s semanticWorkerClaimRoundStats) shouldLogRound() bool {
 	return s.tenantsChecked > 0 && (s.misses > 0 || s.errors > 0)
 }
 
+func (s semanticWorkerClaimRoundStats) logAtInfoLevel() bool {
+	return s.claimed() || s.errors > 0
+}
+
+func (s semanticWorkerClaimRoundStats) logClaimRound(ctx context.Context) {
+	if !s.shouldLogRound() {
+		return
+	}
+	fields := []zap.Field{
+		zap.Int("tenants_checked", s.tenantsChecked),
+		zap.Int("claim_misses", s.misses),
+		zap.Int("claim_errors", s.errors),
+		zap.Int("claim_ok", s.ok),
+		zap.Bool("claimed", s.claimed()),
+	}
+	if s.logAtInfoLevel() {
+		logger.Info(ctx, "semantic_worker_claim_round", fields...)
+		return
+	}
+	logger.Debug(ctx, "semantic_worker_claim_round", fields...)
+}
+
 type semanticTaskAction string
 
 const (
@@ -386,17 +408,6 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 	}
 
 	var round semanticWorkerClaimRoundStats
-	logClaimRound := func() {
-		if !round.shouldLogRound() {
-			return
-		}
-		logger.Info(ctx, "semantic_worker_claim_round",
-			zap.Int("tenants_checked", round.tenantsChecked),
-			zap.Int("claim_misses", round.misses),
-			zap.Int("claim_errors", round.errors),
-			zap.Int("claim_ok", round.ok),
-			zap.Bool("claimed", round.claimed()))
-	}
 	for range len(refs) {
 		target, err := m.nextTargetFromRefs(ctx, refs)
 		if err != nil {
@@ -409,11 +420,11 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 		result := m.processNextTarget(ctx, target)
 		round.record(result)
 		if result == semanticWorkerClaimOk {
-			logClaimRound()
+			round.logClaimRound(ctx)
 			return true
 		}
 	}
-	logClaimRound()
+	round.logClaimRound(ctx)
 	return false
 }
 
