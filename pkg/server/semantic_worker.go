@@ -30,6 +30,7 @@ const (
 	defaultSemanticRetryBaseDelay       = 200 * time.Millisecond
 	defaultSemanticRetryMaxDelay        = 30 * time.Second
 	defaultSemanticTenantScanLimit      = 128
+	defaultSemanticClaimProbeLimit      = 16 // per processNext; independent of scan page size
 	defaultSemanticPerTenantConcurrency = 1
 	semanticLocalTenantID               = "local"
 )
@@ -59,8 +60,14 @@ type SemanticWorkerOptions struct {
 	RetryBaseDelay time.Duration
 	// RetryMaxDelay is the cap for exponential retry backoff.
 	RetryMaxDelay time.Duration
-	// TenantScanLimit bounds active tenants checked per scheduling pass.
+	// TenantScanLimit bounds active tenants fetched per tenant scan page.
 	TenantScanLimit int
+	// ClaimProbeLimit bounds how many tenants receive a ClaimSemanticTask attempt
+	// per processNext call. This is intentionally separate from TenantScanLimit:
+	// a large scan page can be cached and walked incrementally across polls so idle
+	// workers do not open claim transactions for every tenant at once, while still
+	// retrying later tenants on the same page when earlier ones miss.
+	ClaimProbeLimit int
 	// PerTenantConcurrency limits concurrent tasks per tenant.
 	PerTenantConcurrency int
 }
@@ -89,6 +96,9 @@ func (o *SemanticWorkerOptions) normalize() {
 	}
 	if o.TenantScanLimit <= 0 {
 		o.TenantScanLimit = defaultSemanticTenantScanLimit
+	}
+	if o.ClaimProbeLimit <= 0 {
+		o.ClaimProbeLimit = defaultSemanticClaimProbeLimit
 	}
 	if o.PerTenantConcurrency <= 0 {
 		o.PerTenantConcurrency = defaultSemanticPerTenantConcurrency
@@ -137,7 +147,6 @@ type semanticWorkerManager struct {
 	mu         sync.Mutex
 	inflight   map[string]int
 	processing int
-	rr         int
 
 	tenantScanCursorSet       bool
 	tenantScanCursorCreatedAt time.Time
@@ -146,6 +155,15 @@ type semanticWorkerManager struct {
 	tenantScanRoundIncluded   int
 	lastTenantScan            semanticTenantScanSnapshot
 	tenantScanMu              sync.Mutex
+
+	// Cached tenant scan page for claim probing. listTenantRefs advances the global
+	// tenant scan cursor, so processNext must not call it on every poll when only
+	// part of the current page has been probed. claimRefs holds the active page;
+	// claimNext is the next slot to hand out. Protected by claimMu because multiple
+	// worker goroutines call processNext concurrently.
+	claimMu   sync.Mutex
+	claimRefs []semanticTenantRef
+	claimNext int
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -398,18 +416,14 @@ func (m *semanticWorkerManager) recoverLoop(ctx context.Context) {
 }
 
 func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
-	refs, err := m.listTenantRefs(ctx)
-	if err != nil {
-		logger.Warn(ctx, "semantic_worker_pick_tenant_failed", zap.Error(err))
-		return false
-	}
-	if len(refs) == 0 {
-		return false
-	}
-
+	// Walk the cached scan page sequentially, attempting at most ClaimProbeLimit
+	// claim transactions per call. When the budget is exhausted but claimNext has
+	// not reached the end of claimRefs, return false and resume from claimNext on
+	// the next poll instead of fetching a new page (which would skip the remainder
+	// of the current page until the scan wraps).
 	var round semanticWorkerClaimRoundStats
-	for range len(refs) {
-		target, err := m.nextTargetFromRefs(ctx, refs)
+	for probes := 0; probes < m.opts.ClaimProbeLimit; {
+		target, err := m.nextTargetForClaimProbe(ctx)
 		if err != nil {
 			logger.Warn(ctx, "semantic_worker_pick_tenant_failed", zap.Error(err))
 			return false
@@ -417,6 +431,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 		if target == nil {
 			break
 		}
+		probes++
 		result := m.processNextTarget(ctx, target)
 		round.record(result)
 		if result == semanticWorkerClaimOk {
@@ -426,6 +441,92 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 	}
 	round.logClaimRound(ctx)
 	return false
+}
+
+// nextTargetForClaimProbe opens the next tenant eligible for a claim attempt on
+// the cached page. Skipped tenants (inflight limit, open-store failure, no task
+// types) do not consume ClaimProbeLimit; only returned targets that reach
+// processNextTarget count as a probe.
+func (m *semanticWorkerManager) nextTargetForClaimProbe(ctx context.Context) (*semanticTarget, error) {
+	for {
+		ref, ok, err := m.takeNextClaimProbeRef(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		if !m.tryAcquireInflightSlot(ref.id) {
+			continue
+		}
+		target, err := m.targetForRef(ctx, ref)
+		if err != nil {
+			m.releaseTenantSlot(ref.id)
+			logger.Warn(ctx, "semantic_worker_open_store_failed",
+				zap.String("tenant_id", ref.id),
+				zap.Error(err))
+			continue
+		}
+		target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
+		if len(target.allowedTaskTypes) == 0 {
+			target.release()
+			continue
+		}
+		return target, nil
+	}
+}
+
+// takeNextClaimProbeRef returns the next tenant ref from the cached scan page and
+// atomically advances claimNext. A new page is fetched via listTenantRefs only when
+// the cache is empty or fully consumed; concurrent workers double-check the cache
+// after listTenantRefs so only one page load wins and refs are not duplicated.
+func (m *semanticWorkerManager) takeNextClaimProbeRef(ctx context.Context) (semanticTenantRef, bool, error) {
+	for {
+		m.claimMu.Lock()
+		if m.claimRefs != nil && m.claimNext < len(m.claimRefs) {
+			ref := m.claimRefs[m.claimNext]
+			m.claimNext++
+			m.claimMu.Unlock()
+			return ref, true, nil
+		}
+		m.claimRefs = nil
+		m.claimNext = 0
+		m.claimMu.Unlock()
+
+		refs, err := m.listTenantRefs(ctx)
+		if err != nil {
+			return semanticTenantRef{}, false, err
+		}
+
+		m.claimMu.Lock()
+		if m.claimRefs != nil && m.claimNext < len(m.claimRefs) {
+			m.claimMu.Unlock()
+			continue
+		}
+		m.claimRefs = refs
+		m.claimNext = 0
+		if len(m.claimRefs) == 0 {
+			m.claimMu.Unlock()
+			return semanticTenantRef{}, false, nil
+		}
+		ref := m.claimRefs[m.claimNext]
+		m.claimNext++
+		m.claimMu.Unlock()
+		return ref, true, nil
+	}
+}
+
+// tryAcquireInflightSlot reserves per-tenant concurrency before opening a store
+// for claim probing. Separate from claimMu: claimNext hands out distinct refs to
+// concurrent workers, while inflight caps active work per tenant.
+func (m *semanticWorkerManager) tryAcquireInflightSlot(tenantID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.inflight[tenantID] >= m.opts.PerTenantConcurrency {
+		return false
+	}
+	m.inflight[tenantID]++
+	return true
 }
 
 // processNextTarget claims one semantic task for target and dispatches it when found.
@@ -642,54 +743,6 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 			}
 		}()
 	}
-}
-
-func (m *semanticWorkerManager) nextTargetFromRefs(ctx context.Context, refs []semanticTenantRef) (*semanticTarget, error) {
-	if len(refs) == 0 {
-		return nil, nil
-	}
-
-	for i := 0; i < len(refs); i++ {
-		ref, ok := m.claimTenantSlot(refs)
-		if !ok {
-			return nil, nil
-		}
-		target, err := m.targetForRef(ctx, ref)
-		if err != nil {
-			logger.Warn(ctx, "semantic_worker_open_store_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			m.releaseTenantSlot(ref.id)
-			continue
-		}
-		target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
-		if len(target.allowedTaskTypes) == 0 {
-			target.release()
-			continue
-		}
-		return target, nil
-	}
-	return nil, nil
-}
-
-func (m *semanticWorkerManager) claimTenantSlot(refs []semanticTenantRef) (semanticTenantRef, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(refs) == 0 {
-		return semanticTenantRef{}, false
-	}
-	start := m.rr % len(refs)
-	for i := 0; i < len(refs); i++ {
-		idx := (start + i) % len(refs)
-		ref := refs[idx]
-		if m.inflight[ref.id] >= m.opts.PerTenantConcurrency {
-			continue
-		}
-		m.inflight[ref.id]++
-		m.rr = (idx + 1) % len(refs)
-		return ref, true
-	}
-	return semanticTenantRef{}, false
 }
 
 func (m *semanticWorkerManager) releaseTenantSlot(tenantID string) {

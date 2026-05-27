@@ -1152,11 +1152,153 @@ func TestSemanticWorkerClaimRoundStatsLogAtInfoLevel(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerClaimProbeLimitBoundsSingleProcessNext(t *testing.T) {
+	if testDSN == "" {
+		t.Skip("no test database available")
+	}
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := strings.ReplaceAll(token.NewID(), "-", "")[:12]
+	sharedDBName := "drive9_sw_probe_" + suffix
+	mustCreateTestTenantDatabase(t, testDSN, sharedDBName)
+	t.Cleanup(func() {
+		dropTestTenantDatabase(t, testDSN, sharedDBName)
+	})
+
+	pool := newTestSemanticWorkerMultiTenantPool(t)
+	pool.SetMetaStore(metaStore)
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tenantCount = 20
+	tenantIDs := insertSemanticWorkerEmptyTenants(t, metaStore, parsed, passCipher, sharedDBName, tenantCount)
+
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
+		return provider == tenant.ProviderTiDBZero
+	}
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, nil, SemanticWorkerOptions{
+		TenantScanLimit: tenantCount,
+		ClaimProbeLimit: 3,
+		LeaseDuration:   time.Second,
+	})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+
+	ctx := context.Background()
+	if m.processNext(ctx) {
+		t.Fatal("expected all-empty tenants to miss claim")
+	}
+	if got, want := m.claimNext, 3; got != want {
+		t.Fatalf("claimNext=%d, want %d claim probes in one processNext", got, want)
+	}
+	if got, want := len(m.claimRefs), tenantCount; got != want {
+		t.Fatalf("cached claim refs=%d, want %d", got, want)
+	}
+	_, cursorID, cursorSet := m.tenantScanCursor()
+	if !cursorSet || cursorID != tenantIDs[tenantCount-1] {
+		t.Fatalf("tenant scan cursor id=%q set=%v, want last tenant %q", cursorID, cursorSet, tenantIDs[tenantCount-1])
+	}
+}
+
+func TestSemanticWorkerClaimProbeResumesCachedPage(t *testing.T) {
+	if testDSN == "" {
+		t.Skip("no test database available")
+	}
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := strings.ReplaceAll(token.NewID(), "-", "")[:12]
+	sharedDBName := "drive9_sw_probe_" + suffix
+	mustCreateTestTenantDatabase(t, testDSN, sharedDBName)
+	t.Cleanup(func() {
+		dropTestTenantDatabase(t, testDSN, sharedDBName)
+	})
+
+	pool := newTestSemanticWorkerMultiTenantPool(t)
+	pool.SetMetaStore(metaStore)
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tenantCount = 20
+	insertSemanticWorkerEmptyTenants(t, metaStore, parsed, passCipher, sharedDBName, tenantCount)
+
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
+		return provider == tenant.ProviderTiDBZero
+	}
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, nil, SemanticWorkerOptions{
+		TenantScanLimit: tenantCount,
+		ClaimProbeLimit: 3,
+		LeaseDuration:   time.Second,
+	})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+
+	ctx := context.Background()
+	if m.processNext(ctx) {
+		t.Fatal("expected all-empty tenants to miss claim")
+	}
+	if got, want := m.claimNext, 3; got != want {
+		t.Fatalf("first processNext claimNext=%d, want %d", got, want)
+	}
+	_, cursorAfterFirst, cursorSet := m.tenantScanCursor()
+	if !cursorSet {
+		t.Fatal("expected tenant scan cursor after first page load")
+	}
+	firstPageRefCount := len(m.claimRefs)
+
+	if m.processNext(ctx) {
+		t.Fatal("expected second processNext to miss on empty tenants")
+	}
+	if got, want := m.claimNext, 6; got != want {
+		t.Fatalf("second processNext claimNext=%d, want %d", got, want)
+	}
+	_, cursorAfterSecond, _ := m.tenantScanCursor()
+	if cursorAfterSecond != cursorAfterFirst {
+		t.Fatalf("tenant scan cursor moved from %q to %q before page exhausted", cursorAfterFirst, cursorAfterSecond)
+	}
+	if got, want := len(m.claimRefs), firstPageRefCount; got != want {
+		t.Fatalf("cached claim refs=%d, want %d after resume", got, want)
+	}
+	if got, want := m.claimRefs[m.claimNext-1].id, "tenant-probe-05"; got != want {
+		t.Fatalf("last probed tenant id=%q, want %q", got, want)
+	}
+}
+
 func TestSemanticWorkerClaimMissRetriesBacklogTenantOnSamePage(t *testing.T) {
-	// Multi-tenant semantic worker scans active tenants one page at a time and
-	// round-robins a single tenant slot per processNext attempt. When the first
-	// picked tenant has no claimable tasks, processNext should keep trying other
-	// tenants on the same scan page before giving up.
+	// Multi-tenant semantic worker caches one tenant scan page and probes claims
+	// sequentially. When earlier tenants on the page miss, processNext should keep
+	// trying later tenants on the same cached page before giving up.
 	if testDSN == "" {
 		t.Skip("no test database available")
 	}
@@ -1246,12 +1388,12 @@ func TestSemanticWorkerClaimMissRetriesBacklogTenantOnSamePage(t *testing.T) {
 
 	m := newSemanticWorkerManager(nil, metaStore, pool, nil, SemanticWorkerOptions{
 		TenantScanLimit: 8,
+		ClaimProbeLimit: 8,
 		LeaseDuration:   time.Second,
 	})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
 	}
-	m.rr = 0
 
 	ctx := context.Background()
 	// Both tenants fit on one scan page; empty tenant sorts first by created_at.
@@ -1897,6 +2039,35 @@ func mustGetServerSemanticTask(t *testing.T, b *backend.Dat9Backend, taskID stri
 		t.Fatalf("get semantic task %s: %v", taskID, err)
 	}
 	return task
+}
+
+func insertSemanticWorkerEmptyTenants(t *testing.T, metaStore *meta.Store, parsed *mysql.Config, passCipher []byte, dbName string, count int) []string {
+	t.Helper()
+	host, port := mysqlHostPortFromDSN(parsed)
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	ids := make([]string, count)
+	for i := range count {
+		id := fmt.Sprintf("tenant-probe-%02d", i)
+		ids[i] = id
+		createdAt := base.Add(time.Duration(i) * time.Millisecond)
+		if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+			ID:               id,
+			Status:           meta.TenantActive,
+			DBHost:           host,
+			DBPort:           port,
+			DBUser:           parsed.User,
+			DBPasswordCipher: passCipher,
+			DBName:           dbName,
+			DBTLS:            false,
+			Provider:         tenant.ProviderTiDBZero,
+			SchemaVersion:    1,
+			CreatedAt:        createdAt,
+			UpdatedAt:        createdAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ids
 }
 
 func mysqlHostPortFromDSN(parsed *mysql.Config) (host string, port int) {

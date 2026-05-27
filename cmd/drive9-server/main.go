@@ -717,6 +717,8 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
 		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
 		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
+		// Separate from tenant scan page size; see SemanticWorkerOptions.ClaimProbeLimit.
+		ClaimProbeLimit:      envInt("DRIVE9_SEMANTIC_CLAIM_PROBE_LIMIT", 16),
 		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
